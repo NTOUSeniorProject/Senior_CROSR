@@ -3,15 +3,15 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
-from ntu_normalize import normalize_skeleton_batch, get_valid_mask
+from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 
 from datetime import datetime
 import os
 from pathlib import Path
 
-from ntu_skeleton_dataset import NTUSkeletonDataset
-from ST_CROSR import ST_CROSR
-from center_loss import CenterLoss
+from Functions.ntu_skeleton_dataset import NTUSkeletonDataset
+from Functions.ST_CROSR import ST_CROSR
+from Functions.center_loss import CenterLoss
 import time
 # ============================================================
 # ⚙️ 核心參數設定區 (在此調整即可)

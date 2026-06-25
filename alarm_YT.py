@@ -8,8 +8,8 @@ import numpy as np
 import torch.nn.functional as F
 from ultralytics import YOLO
 
-from ST_CROSR import ST_CROSR
-from ntu_normalize import normalize_skeleton_batch, get_valid_mask
+from Functions.ST_CROSR import ST_CROSR
+from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 
 
 # ============================================================
