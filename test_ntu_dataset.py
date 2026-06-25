@@ -7,11 +7,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import os
-from ntu_normalize import normalize_skeleton_batch, get_valid_mask
+from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 
 # 引用您的 NTU 專用模組與模型定義
-from ntu_skeleton_dataset import NTUSkeletonDataset
-from ST_CROSR import ST_CROSR
+from Functions.ntu_skeleton_dataset import NTUSkeletonDataset
+from Functions.ST_CROSR import ST_CROSR
 
 # 解決 matplotlib 繪圖時的中文字體問題
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'PingFang HK', 'SimHei'] 
