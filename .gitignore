@@ -10,3 +10,4 @@
 *.pth
 *.onnx
 *.ckpt
+*.env
