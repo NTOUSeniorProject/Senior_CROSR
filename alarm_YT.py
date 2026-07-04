@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import cv2
 import torch
 import shutil
@@ -7,6 +8,10 @@ import subprocess
 import numpy as np
 import torch.nn.functional as F
 from ultralytics import YOLO
+
+# Functions 內部模組（如 ST_CROSR）使用頂層匯入（from STGCNEncoder import ...），
+# 必須把 Functions 目錄加入搜尋路徑才能解析
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Functions"))
 
 from Functions.ST_CROSR import ST_CROSR
 from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
@@ -31,9 +36,9 @@ CONFIG = {
     # YouTube 影片 / 直播範例：
     "video_path": r"https://youtu.be/kD0RBvXA1q4?si=ZJnV3lV45Yifloay",
 
-    "yolo_model_path": r"C:\CROSR\yolo26x-pose.pt",
+    "yolo_model_path": r"yolo26x-pose.pt",
     "checkpoint_path": r"checkpoints_20260602_2237\best_val.pth",
-    "radar_meta_path": r"C:\CROSR\radar_meta_params.pth",
+    "radar_meta_path": r"radar_meta_params.pth",
 
     "max_frames": 300,
     "num_nodes": 17,
@@ -827,7 +832,11 @@ def play_and_live_inference(
     print("\n🏁 影片串流即時掃描結束。")
 
 
-def main():
+def main(video_path=None):
+    # 有傳入影片來源（例如從 LineBot 收到的連結）就覆蓋 CONFIG 預設值
+    if video_path:
+        CONFIG["video_path"] = video_path
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("============================================================")
@@ -858,4 +867,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else None)
