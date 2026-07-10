@@ -30,11 +30,16 @@ def start_alarm_process(video_url: str):
     """
     script_path = os.path.join(BASE_DIR, "alarm_YT.py")
 
+    # process = subprocess.Popen(
+    #     [sys.executable, script_path, video_url],
+    #     cwd=BASE_DIR
+    # )
     process = subprocess.Popen(
-        [sys.executable, script_path, video_url],
+        [sys.executable, script_path, video_url, user_id],
         cwd=BASE_DIR
     )
-
+    
+    print(f"LINE user_id：{user_id}")
     print(f"已啟動 alarm_YT.py（PID: {process.pid}），影片來源：{video_url}")
     return process
 
@@ -158,7 +163,7 @@ def callback():
                     print(f"收到使用者 {user_id} 的影片連結：{user_text}")
 
                     try:
-                        start_alarm_process(user_text)
+                        start_alarm_process(user_text, user_id)
                         reply_messages(reply_token, [
                             {
                                 "type": "text",

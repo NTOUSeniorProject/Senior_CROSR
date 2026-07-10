@@ -4,11 +4,17 @@ import sys
 import cv2
 import torch
 import shutil
+import requests
 import subprocess
 import numpy as np
 import torch.nn.functional as F
 from ultralytics import YOLO
+from dotenv import load_dotenv
 
+
+load_dotenv()
+
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 # Functions 內部模組（如 ST_CROSR）使用頂層匯入（from STGCNEncoder import ...），
 # 必須把 Functions 目錄加入搜尋路徑才能解析
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Functions"))
@@ -88,6 +94,70 @@ CONFIG = {
     "is_live_stream": False,
 }
 
+def push_line_message(user_id: str, text: str):
+    """
+    使用 LINE Push Message API 主動傳訊息給指定使用者。
+    如果沒有 user_id，就進入測試模式，只把訊息印在終端機。
+    """
+    if not user_id:
+        print("\n" + "=" * 60)
+        print("🧪 LINE 推播測試模式")
+        print("因為沒有 LINE user_id，所以不會真的傳送。")
+        print("如果正式推播，LINE 會收到以下訊息：")
+        print("-" * 60)
+        print(text)
+        print("=" * 60 + "\n")
+        return
+
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("⚠️ 缺少 LINE_CHANNEL_ACCESS_TOKEN，跳過 LINE 推播。")
+        return
+
+    url = "https://api.line.me/v2/bot/message/push"
+
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "to": user_id,
+        "messages": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ]
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+
+        print("LINE Push 狀態碼：", response.status_code)
+        print("LINE Push 回應：", response.text)
+
+        response.raise_for_status()
+
+    except Exception as e:
+        print("❌ LINE Push Message 發送失敗：")
+        print(e)
+
+
+def build_alert_message(current_sec, consecutive_duration, radar_res, threshold):
+    """
+    組出要傳到 LINE 的異常警報文字。
+    """
+    nearest_action = radar_res.get("nearest_action_name", "unknown")
+    combined_score = radar_res.get("combined_score", 0)
+
+    return (
+        "🚨 偵測到異常動作！\n"
+        f"發生時間：約第 {current_sec:.2f} 秒\n"
+        f"連續異常：約 {consecutive_duration:.1f} 秒\n"
+        f"異常分數：{combined_score:.4f}\n"
+        f"判斷閾值：{threshold:.4f}\n"
+        f"最接近的正常動作：{nearest_action}"
+    )
 
 DEFAULT_KNOWN_ACTIONS = [
     1, 2, 3, 4, 5, 6,
@@ -498,7 +568,8 @@ def play_and_live_inference(
     normalizer,
     threshold,
     dist_weight,
-    mse_weight
+    mse_weight,
+    line_user_id=None
 ):
     cap, resolved_source = open_video_capture(video_path)
 
@@ -635,6 +706,15 @@ def play_and_live_inference(
                                 f"{current_radar_res['nearest_action_name']}"
                             )
 
+                            alert_text = build_alert_message(
+                                current_sec=current_sec,
+                                consecutive_duration=consecutive_duration,
+                                radar_res=current_radar_res,
+                                threshold=threshold
+                            )
+
+                            push_line_message(line_user_id, alert_text)
+
                             last_alert_time = current_sec
                         else:
                             print(
@@ -660,6 +740,15 @@ def play_and_live_inference(
                             f"    -> 最接近正常動作："
                             f"{current_radar_res['nearest_action_name']}"
                         )
+
+                        alert_text = build_alert_message(
+                            current_sec=current_sec,
+                            consecutive_duration=0,
+                            radar_res=current_radar_res,
+                            threshold=threshold
+                        )
+
+                        push_line_message(line_user_id, alert_text)
 
                         last_alert_time = current_sec
                     else:
@@ -832,10 +921,15 @@ def play_and_live_inference(
     print("\n🏁 影片串流即時掃描結束。")
 
 
-def main(video_path=None):
+def main(video_path=None, line_user_id=None):
     # 有傳入影片來源（例如從 LineBot 收到的連結）就覆蓋 CONFIG 預設值
     if video_path:
         CONFIG["video_path"] = video_path
+
+    if line_user_id:
+        print(f"✅ 已接收 LINE user_id：{line_user_id}")
+    else:
+        print("⚠️ 未接收 LINE user_id，本次只會在終端機顯示警報，不會推播到 LINE。")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -862,9 +956,12 @@ def main(video_path=None):
         normalizer,
         threshold,
         dist_weight,
-        mse_weight
+        mse_weight,
+        line_user_id=line_user_id
     )
 
-
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    video_path = sys.argv[1] if len(sys.argv) > 1 else None
+    line_user_id = sys.argv[2] if len(sys.argv) > 2 else None
+
+    main(video_path, line_user_id)
