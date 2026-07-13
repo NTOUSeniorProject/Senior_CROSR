@@ -24,23 +24,21 @@ user_states = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def start_alarm_process(video_url: str):
+def start_alarm_process(video_url: str, user_id: str):
     """
     在背景啟動 alarm_YT.py 進行影片推論，不阻塞 webhook 回應。
+    同時把 LINE user_id 傳給 alarm_YT.py，讓偵測到異常時可以推播回 LINE。
     """
     script_path = os.path.join(BASE_DIR, "alarm_YT.py")
 
-    # process = subprocess.Popen(
-    #     [sys.executable, script_path, video_url],
-    #     cwd=BASE_DIR
-    # )
     process = subprocess.Popen(
         [sys.executable, script_path, video_url, user_id],
         cwd=BASE_DIR
     )
-    
+
     print(f"LINE user_id：{user_id}")
     print(f"已啟動 alarm_YT.py（PID: {process.pid}），影片來源：{video_url}")
+
     return process
 
 
