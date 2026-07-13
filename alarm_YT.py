@@ -63,7 +63,7 @@ CONFIG = {
     # True  → 需連續偵測異常達 consecutive_alert_sec 秒才觸發警報
     # False → 單次超過閾值就立即報警
     "use_consecutive_alert": True,
-    "consecutive_alert_sec": 1,
+    "consecutive_alert_sec": 4,
 
     # 報警後冷卻時間（秒），冷卻期間不重複警報
     "alert_cooldown_sec": 4,
