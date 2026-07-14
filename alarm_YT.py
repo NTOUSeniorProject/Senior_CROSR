@@ -189,6 +189,92 @@ ACTION_NAMES = {
 }
 
 
+def format_video_time(seconds):
+    """
+    將秒數轉換成適合 LINE 顯示的時間格式。
+    例如：
+    65.3 秒 -> 01:05
+    3665 秒 -> 01:01:05
+    """
+    seconds = max(0, int(seconds))
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    return f"{minutes:02d}:{secs:02d}"
+
+def build_analysis_summary(video_duration, alert_events, stopped_by_user=False):
+    """
+    建立影片分析完成後的 LINE 摘要訊息。
+    """
+
+    if stopped_by_user:
+        title = "⛔ 影片分析已停止"
+    else:
+        title = "✅ 影片分析完成"
+
+    summary_lines = [
+        title,
+        "",
+        f"影片分析長度：{format_video_time(video_duration)}",
+        f"異常事件數量：{len(alert_events)} 次"
+    ]
+
+    if len(alert_events) == 0:
+        summary_lines.extend([
+            "",
+            "本次分析未偵測到符合警報條件的異常事件。"
+        ])
+
+        return "\n".join(summary_lines)
+
+    highest_score = max(
+        event.get("max_score", 0)
+        for event in alert_events
+    )
+
+    summary_lines.append(f"最高異常分數：{highest_score:.4f}")
+    summary_lines.append("")
+    summary_lines.append("📋 異常事件紀錄")
+
+    # 避免 LINE 訊息過長，最多列出前 10 個事件
+    max_display_events = 10
+
+    for index, event in enumerate(
+        alert_events[:max_display_events],
+        start=1
+    ):
+        start_sec = event.get("start_sec", 0)
+        end_sec = event.get("end_sec", start_sec)
+        duration = event.get("duration", end_sec - start_sec)
+        max_score = event.get("max_score", 0)
+        nearest_action = event.get("nearest_action", "unknown")
+
+        summary_lines.extend([
+            "",
+            f"事件 {index}",
+            (
+                f"時間：{format_video_time(start_sec)}"
+                f" ～ {format_video_time(end_sec)}"
+            ),
+            f"持續：約 {duration:.1f} 秒",
+            f"最高分數：{max_score:.4f}",
+            f"最接近正常動作：{nearest_action}"
+        ])
+
+    if len(alert_events) > max_display_events:
+        remaining = len(alert_events) - max_display_events
+
+        summary_lines.extend([
+            "",
+            f"另外還有 {remaining} 個異常事件未顯示。"
+        ])
+
+    return "\n".join(summary_lines)
 # ============================================================
 # 新增：影片來源解析
 # ============================================================
@@ -617,13 +703,30 @@ def play_and_live_inference(
 
     print("============================================================\n")
 
+    # skeleton_buffer = []
+    # frame_idx = 0
+    # last_alert_time = -9999
+    # current_radar_res = None
+
+    # consecutive_anomaly_start = None
+
     skeleton_buffer = []
     frame_idx = 0
     last_alert_time = -9999
     current_radar_res = None
 
+    # 異常分數剛開始超過閾值的時間
     consecutive_anomaly_start = None
 
+    # 已完成的異常事件
+    alert_events = []
+
+    # 目前正在發生的異常事件
+    # 尚未正式達到 consecutive_alert_sec 時保持 None
+    active_alert_event = None
+
+    # 防止同一段異常重複推播開始警報
+    alert_notification_sent = False
     while True:
         ret, frame = cap.read()
 
@@ -689,25 +792,52 @@ def play_and_live_inference(
             # Step 3: 報警判斷
             if current_radar_res["is_unknown"]:
                 if CONFIG["use_consecutive_alert"]:
+                    # 第一次超過閾值，開始累積異常時間
                     if consecutive_anomaly_start is None:
                         consecutive_anomaly_start = current_sec
+                        alert_notification_sent = False
 
-                    consecutive_duration = current_sec - consecutive_anomaly_start
+                    consecutive_duration = (
+                        current_sec - consecutive_anomaly_start
+                    )
 
                     if consecutive_duration >= CONFIG["consecutive_alert_sec"]:
-                        if current_sec - last_alert_time >= CONFIG["alert_cooldown_sec"]:
+                        # 正式建立異常事件，只建立一次
+                        if active_alert_event is None:
+                            active_alert_event = {
+                                # 事件開始時間使用最初超過閾值的時間
+                                "start_sec": consecutive_anomaly_start,
+                                "max_score": current_radar_res["combined_score"],
+                                "nearest_action": current_radar_res[
+                                    "nearest_action_name"
+                                ]
+                            }
+
                             print(
-                                f"🚨 【異常爆警!!】影片播放到 [ {current_sec:6.2f} 秒 ] 🔴 "
+                                f"🚨 【異常事件開始】"
+                                f"影片播放到 [ {current_sec:6.2f} 秒 ] "
                                 f"連續異常 {consecutive_duration:.1f} 秒，"
-                                f"綜合異常分：{current_radar_res['combined_score']:.4f} "
+                                f"綜合異常分："
+                                f"{current_radar_res['combined_score']:.4f} "
                                 f"超過閾值 ({threshold:.4f})！"
                             )
 
-                            print(
-                                f"    -> 最接近正常動作："
-                                f"{current_radar_res['nearest_action_name']}"
-                            )
+                        else:
+                            # 異常持續期間更新最高分數
+                            if (
+                                current_radar_res["combined_score"]
+                                > active_alert_event["max_score"]
+                            ):
+                                active_alert_event["max_score"] = (
+                                    current_radar_res["combined_score"]
+                                )
 
+                                active_alert_event["nearest_action"] = (
+                                    current_radar_res["nearest_action_name"]
+                                )
+
+                        # 同一段異常只推播一次
+                        if not alert_notification_sent:
                             alert_text = build_alert_message(
                                 current_sec=current_sec,
                                 consecutive_duration=consecutive_duration,
@@ -717,24 +847,33 @@ def play_and_live_inference(
 
                             push_line_message(line_user_id, alert_text)
 
+                            alert_notification_sent = True
                             last_alert_time = current_sec
+
                         else:
                             print(
-                                f"⚠️ [持續異常偵測中] {current_sec:6.2f} 秒 | "
-                                f"冷卻中，跳過重複報警。"
+                                f"⚠️ [異常事件持續中] "
+                                f"{current_sec:6.2f} 秒 | "
+                                f"目前分數："
+                                f"{current_radar_res['combined_score']:.4f}"
                             )
+
                     else:
                         print(
                             f"⏳ [異常累積中] {current_sec:6.2f} 秒 | "
                             f"已持續 {consecutive_duration:.1f}/"
                             f"{CONFIG['consecutive_alert_sec']} 秒 "
-                            f"| 分數：{current_radar_res['combined_score']:.4f}"
+                            f"| 分數："
+                            f"{current_radar_res['combined_score']:.4f}"
                         )
                 else:
+                    # 不使用連續異常模式時，每次符合條件都記錄成一個事件
                     if current_sec - last_alert_time >= CONFIG["alert_cooldown_sec"]:
                         print(
-                            f"🚨 【異常爆警!!】影片播放到 [ {current_sec:6.2f} 秒 ] 🔴 "
-                            f"綜合異常分：{current_radar_res['combined_score']:.4f} "
+                            f"🚨 【異常爆警!!】影片播放到 "
+                            f"[ {current_sec:6.2f} 秒 ] 🔴 "
+                            f"綜合異常分："
+                            f"{current_radar_res['combined_score']:.4f} "
                             f"超過閾值 ({threshold:.4f})！"
                         )
 
@@ -752,19 +891,74 @@ def play_and_live_inference(
 
                         push_line_message(line_user_id, alert_text)
 
+                        alert_events.append({
+                            "start_sec": current_sec,
+                            "end_sec": current_sec,
+                            "duration": 0,
+                            "max_score": current_radar_res["combined_score"],
+                            "nearest_action": current_radar_res[
+                                "nearest_action_name"
+                            ]
+                        })
+
                         last_alert_time = current_sec
                     else:
                         print(
-                            f"⚠️ [持續異常偵測中] {current_sec:6.2f} 秒 | "
+                            f"⚠️ [持續異常偵測中] "
+                            f"{current_sec:6.2f} 秒 | "
                             f"冷卻中，跳過重複報警。"
                         )
+
+                        print(
+                            f"    -> 最接近正常動作："
+                            f"{current_radar_res['nearest_action_name']}"
+                        )
+
+                        alert_text = build_alert_message(
+                            current_sec=current_sec,
+                            consecutive_duration=0,
+                            radar_res=current_radar_res,
+                            threshold=threshold
+                        )
+
+                        push_line_message(line_user_id, alert_text)
+
+                        last_alert_time = current_sec
+                    # else:
+                    #     print(
+                    #         f"⚠️ [持續異常偵測中] {current_sec:6.2f} 秒 | "
+                    #         f"冷卻中，跳過重複報警。"
+                    #     )
             else:
                 if consecutive_anomaly_start is not None:
                     print(
                         f"✅ [{current_sec:6.2f} 秒] "
                         f"異常解除，連續異常中斷。"
                     )
-                    consecutive_anomaly_start = None
+
+                # 如果已經正式成立一個異常事件，將它結束並保存
+                if active_alert_event is not None:
+                    active_alert_event["end_sec"] = current_sec
+                    active_alert_event["duration"] = (
+                        active_alert_event["end_sec"]
+                        - active_alert_event["start_sec"]
+                    )
+
+                    alert_events.append(active_alert_event)
+
+                    print(
+                        f"📌 已記錄異常事件："
+                        f"{active_alert_event['start_sec']:.2f} 秒"
+                        f" ～ {active_alert_event['end_sec']:.2f} 秒，"
+                        f"共 {active_alert_event['duration']:.2f} 秒，"
+                        f"最高分數 "
+                        f"{active_alert_event['max_score']:.4f}"
+                    )
+
+                    active_alert_event = None
+
+                consecutive_anomaly_start = None
+                alert_notification_sent = False
 
         # Step 4: 即時渲染 UI
         if CONFIG["show_yolo_window"]:
@@ -917,8 +1111,36 @@ def play_and_live_inference(
             
         frame_idx += 1
 
+    # 如果影片結束時仍然處於異常狀態，
+    # 將尚未完成的事件補上結束時間
+    final_video_sec = frame_idx / fps
+
+    if active_alert_event is not None:
+        active_alert_event["end_sec"] = final_video_sec
+        active_alert_event["duration"] = (
+            active_alert_event["end_sec"]
+            - active_alert_event["start_sec"]
+        )
+
+        alert_events.append(active_alert_event)
+        active_alert_event = None
+
     cap.release()
     cv2.destroyAllWindows()
+
+    print("\n🏁 影片串流即時掃描結束。")
+
+    # 建立並傳送分析摘要
+    summary_text = build_analysis_summary(
+        video_duration=final_video_sec,
+        alert_events=alert_events
+    )
+
+    print("\n" + "=" * 60)
+    print(summary_text)
+    print("=" * 60 + "\n")
+
+    push_line_message(line_user_id, summary_text)
 
     print("\n🏁 影片串流即時掃描結束。")
 
