@@ -10,6 +10,8 @@ import numpy as np
 import torch.nn.functional as F
 from ultralytics import YOLO
 from dotenv import load_dotenv
+from collections import deque
+from VLM_check import analyze_frames_with_ollama
 
 
 load_dotenv()
@@ -53,6 +55,14 @@ CONFIG = {
     "window_size": 120,
     "stride": 30,
 
+    "anomaly_confirm_window_sec": 3.0,
+    "anomaly_vote_ratio": 0.70,
+    "min_anomaly_votes": 3,
+    
+    "consecutive_alert_sec": 2.0,
+    "clear_normal_windows": 3,
+    "alert_cooldown_sec": 30.0,
+
     # ── 閾值設定 ──────────────────────────────────────────────
     # True  → 使用 radar_meta_params.pth 裡面儲存的閾值
     # False → 使用下方 manual_threshold
@@ -63,7 +73,7 @@ CONFIG = {
     # True  → 需連續偵測異常達 consecutive_alert_sec 秒才觸發警報
     # False → 單次超過閾值就立即報警
     "use_consecutive_alert": True,
-    "consecutive_alert_sec": 4,
+    "consecutive_alert_sec": 2,
 
     # 報警後冷卻時間（秒），冷卻期間不重複警報
     "alert_cooldown_sec": 4,
@@ -156,7 +166,7 @@ def build_alert_message(current_sec, consecutive_duration, radar_res, threshold)
         f"連續異常：約 {consecutive_duration:.1f} 秒\n"
         f"異常分數：{combined_score:.4f}\n"
         f"判斷閾值：{threshold:.4f}\n"
-        f"最接近的正常動作：{nearest_action}"
+        #f"最接近的正常動作：{nearest_action}"
     )
 
 DEFAULT_KNOWN_ACTIONS = [
@@ -644,6 +654,208 @@ def predict_one_clip(
     }
 
 
+PRE_EVENT_SECONDS = 5.0
+POST_EVENT_SECONDS = 5.0
+POST_MIN_ANOMALY_VOTES = 1
+POST_ANOMALY_RATIO_THRESHOLD = 0.30
+VLM_SAMPLE_FRAME_COUNT = 8
+ANOMALY_OUTPUT_ROOT = "./abnormal_events"
+
+
+def start_event_collection(
+    pre_event_buffer,
+    current_sec,
+    anomaly_event_start,
+    pre_event_seconds=PRE_EVENT_SECONDS,
+    post_event_seconds=POST_EVENT_SECONDS,
+):
+    """複製正式確認前 5 秒影格，並設定後 5 秒截止時間。"""
+
+    event_start_sec = max(
+        0.0,
+        current_sec - pre_event_seconds,
+    )
+
+    event_collect_until_sec = (
+        current_sec + post_event_seconds
+    )
+
+    event_frames = [
+        {
+            "time": item["time"],
+            "frame": item["frame"].copy(),
+        }
+        for item in pre_event_buffer
+        if item["time"] >= event_start_sec
+    ]
+
+    return (
+        event_frames,
+        event_start_sec,
+        event_collect_until_sec,
+    )
+
+
+def should_keep_event(
+    anomaly_flags,
+    min_votes=POST_MIN_ANOMALY_VOTES,
+    ratio_threshold=POST_ANOMALY_RATIO_THRESHOLD,
+):
+    """依異常確認後的滑動視窗結果，決定是否保留事件。"""
+
+    total_count = len(anomaly_flags)
+    anomaly_count = int(sum(anomaly_flags))
+
+    anomaly_ratio = (
+        anomaly_count / total_count
+        if total_count > 0
+        else 0.0
+    )
+
+    keep = (
+        anomaly_count >= min_votes
+        and anomaly_ratio >= ratio_threshold
+    )
+
+    return (
+        keep,
+        anomaly_count,
+        total_count,
+        anomaly_ratio,
+    )
+
+
+def save_anomaly_event_frames(
+    event_id,
+    event_frames,
+    fps,
+    output_root=ANOMALY_OUTPUT_ROOT,
+    vlm_frame_count=VLM_SAMPLE_FRAME_COUNT,
+):
+    """保存完整事件影片，並平均抽取數張圖片供 VLM 分析。"""
+    if not event_frames:
+        raise ValueError("異常事件沒有可保存的影格。")
+
+    event_dir = os.path.join(output_root, event_id)
+    sampled_dir = os.path.join(event_dir, "vlm_frames")
+    os.makedirs(sampled_dir, exist_ok=True)
+
+    first_frame = event_frames[0]["frame"]
+    height, width = first_frame.shape[:2]
+    video_path = os.path.join(event_dir, "event.mp4")
+
+    writer = cv2.VideoWriter(
+        video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"無法建立異常影片：{video_path}")
+
+    try:
+        for item in event_frames:
+            output_frame = item["frame"]
+            if output_frame.shape[:2] != (height, width):
+                output_frame = cv2.resize(output_frame, (width, height))
+            writer.write(output_frame)
+    finally:
+        writer.release()
+
+    sample_count = min(vlm_frame_count, len(event_frames))
+    if sample_count <= 1:
+        sampled_indices = [0]
+    else:
+        sampled_indices = np.linspace(
+            0,
+            len(event_frames) - 1,
+            sample_count,
+            dtype=int,
+        ).tolist()
+
+    sampled_paths = []
+    for order, frame_index in enumerate(sampled_indices):
+        item = event_frames[frame_index]
+        image_path = os.path.join(
+            sampled_dir,
+            f"frame_{order:02d}_{item['time']:.2f}s.jpg",
+        )
+        if cv2.imwrite(
+            image_path,
+            item["frame"],
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        ):
+            sampled_paths.append(image_path)
+
+    print(f"🎬 異常影片已保存：{video_path}")
+    print(f"🖼️ 已抽取 {len(sampled_paths)} 張 VLM 影格：{sampled_dir}")
+
+    return {
+        "event_id": event_id,
+        "video_path": video_path,
+        "frame_paths": sampled_paths,
+        "start_time": event_frames[0]["time"],
+        "end_time": event_frames[-1]["time"],
+        "total_frames": len(event_frames),
+    }
+
+
+def finish_event_collection(
+    event_id,
+    event_frames,
+    anomaly_flags,
+    fps,
+    force_partial=False,
+):
+    """
+    完整收集後 5 秒時：
+    至少 2 個異常視窗，且異常比例達 30%。
+
+    影片提早結束時：
+    至少 1 個異常視窗，且異常比例達 50%。
+    """
+
+    if force_partial:
+        min_votes = 1
+        ratio_threshold = 0.5
+    else:
+        min_votes = POST_MIN_ANOMALY_VOTES
+        ratio_threshold = POST_ANOMALY_RATIO_THRESHOLD
+
+    (
+        keep,
+        anomaly_count,
+        total_count,
+        anomaly_ratio,
+    ) = should_keep_event(
+        anomaly_flags=anomaly_flags,
+        min_votes=min_votes,
+        ratio_threshold=ratio_threshold,
+    )
+
+    if not keep:
+        print(
+            f"🗑️ 丟棄事件 {event_id} | "
+            f"後段異常 {anomaly_count}/{total_count} | "
+            f"比例 {anomaly_ratio:.0%} | "
+            f"門檻：至少 {min_votes} 票、"
+            f"比例至少 {ratio_threshold:.0%}"
+        )
+        return None
+
+    print(
+        f"✅ 保留事件 {event_id} | "
+        f"後段異常 {anomaly_count}/{total_count} | "
+        f"比例 {anomaly_ratio:.0%}"
+    )
+
+    return save_anomaly_event_frames(
+        event_id=event_id,
+        event_frames=event_frames,
+        fps=fps,
+    )
+
+
 # ============================================================
 # 即時視訊串流播放與排雷監控
 # ============================================================
@@ -659,13 +871,34 @@ def play_and_live_inference(
     mse_weight,
     line_user_id=None
 ):
+    """
+    改良版異常偵測邏輯（不加入骨架品質判斷）：
+
+    1. 每次滑動視窗都送入模型判斷。
+    2. 使用最近一段時間內的 unknown 比例，而不是單次 unknown 就報警。
+    3. 異常候選需持續一段時間才正式報警。
+    4. 異常成立後，需連續多個正常視窗才解除。
+    5. 保留通知冷卻，避免持續異常時重複洗版。
+    """
+
     cap, resolved_source = open_video_capture(video_path)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if fps <= 0 or np.isnan(fps):
-        fps = 30
+        fps = 30.0
+
+    # 平常只保留最近 5 秒原始影格。所有事件狀態都限定在本次播放中。
+    pre_event_buffer = deque(
+        maxlen=max(1, int(np.ceil(fps * PRE_EVENT_SECONDS)))
+    )
+    collecting_event = False
+    event_id = None
+    event_start_sec = None
+    event_collect_until_sec = None
+    event_frames = []
+    post_event_anomaly_flags = []
 
     is_live_like_source = (
         ".m3u8" in resolved_source.lower()
@@ -674,8 +907,48 @@ def play_and_live_inference(
         or total_frames <= 0
     )
 
+    window_size = int(CONFIG.get("window_size", 60))
+    stride = max(1, int(CONFIG.get("stride", 5)))
+
+    # 最近 confirm_window_sec 秒內的推論結果，
+    # unknown 比例達 anomaly_vote_ratio 才視為異常候選。
+    confirm_window_sec = float(
+        CONFIG.get("anomaly_confirm_window_sec", 3.0)
+    )
+    anomaly_vote_ratio = float(
+        CONFIG.get("anomaly_vote_ratio", 0.70)
+    )
+    min_anomaly_votes = int(
+        CONFIG.get("min_anomaly_votes", 3)
+    )
+
+    # 異常候選需持續多久才正式報警
+    consecutive_alert_sec = float(
+        CONFIG.get("consecutive_alert_sec", 2.0)
+    )
+
+    # 正式異常後，需連續多少個正常視窗才解除
+    clear_normal_windows = int(
+        CONFIG.get("clear_normal_windows", 3)
+    )
+
+    alert_cooldown_sec = float(
+        CONFIG.get("alert_cooldown_sec", 30.0)
+    )
+
+    evaluation_interval_sec = stride / fps
+    vote_history_size = max(
+        min_anomaly_votes,
+        int(
+            np.ceil(
+                confirm_window_sec
+                / max(evaluation_interval_sec, 1e-6)
+            )
+        )
+    )
+
     print("\n============================================================")
-    print("🚀 啟動即時序列串流推論監控系統...")
+    print("🚀 啟動改良版即時異常動作監控系統...")
     print(f"原始影片來源: {video_path}")
 
     if resolved_source != video_path:
@@ -683,24 +956,21 @@ def play_and_live_inference(
 
     if is_live_like_source:
         print("影片模式: 串流 / 直播 / 無固定總長度")
-        print(f"FPS: {fps:.2f}")
     else:
-        print(f"影片預估總長度: {total_frames / fps:.2f} 秒 (共 {total_frames} 幀)")
-        print(f"FPS: {fps:.2f}")
+        print(
+            f"影片預估總長度: "
+            f"{total_frames / fps:.2f} 秒 ({total_frames} 幀)"
+        )
 
-    threshold_label = (
-        "使用儲存閾值"
-        if CONFIG["use_saved_threshold"]
-        else f"手動閾值 = {threshold:.4f}"
+    print(f"FPS: {fps:.2f}")
+    print(f"骨架視窗: {window_size} 幀，步長: {stride} 幀")
+    print(
+        f"異常投票: 最近約 {confirm_window_sec:.1f} 秒內，"
+        f"unknown 比例至少 {anomaly_vote_ratio:.0%}"
     )
-
-    print(f"閾值模式: {threshold_label}")
-
-    if CONFIG["use_consecutive_alert"]:
-        print(f"報警模式: 連續 {CONFIG['consecutive_alert_sec']} 秒才報警")
-    else:
-        print("報警模式: 單次即報警")
-
+    print(f"候選異常維持: {consecutive_alert_sec:.1f} 秒")
+    print(f"解除條件: 連續 {clear_normal_windows} 個正常視窗")
+    print(f"通知冷卻: {alert_cooldown_sec:.1f} 秒")
     print("============================================================\n")
 
     # skeleton_buffer = []
@@ -711,12 +981,18 @@ def play_and_live_inference(
     # consecutive_anomaly_start = None
 
     skeleton_buffer = []
+    anomaly_vote_history = []
+
     frame_idx = 0
-    last_alert_time = -9999
+    last_alert_time = -9999.0
     current_radar_res = None
 
-    # 異常分數剛開始超過閾值的時間
-    consecutive_anomaly_start = None
+    # normal -> candidate -> alert
+    detection_state = "normal"
+    anomaly_candidate_start = None
+    anomaly_event_start = None
+    consecutive_normal_count = 0
+    current_anomaly_ratio = 0.0
 
     # 已完成的異常事件
     alert_events = []
@@ -731,51 +1007,113 @@ def play_and_live_inference(
         ret, frame = cap.read()
 
         if not ret:
-            if CONFIG["is_live_stream"]:
+            if CONFIG.get("is_live_stream", is_live_like_source):
                 print("⚠️ 直播串流暫時中斷，嘗試重新連線...")
-
                 cap.release()
 
                 try:
                     cap, resolved_source = open_video_capture(video_path)
-                    print("✅ 重新連線成功，繼續推論。")
+                    print("✅ 重新連線成功，重新建立判斷緩衝區。")
+
+                    skeleton_buffer.clear()
+                    anomaly_vote_history.clear()
+
+                    detection_state = "normal"
+                    anomaly_candidate_start = None
+                    anomaly_event_start = None
+                    consecutive_normal_count = 0
+                    current_anomaly_ratio = 0.0
                     continue
-                except Exception as e:
+
+                except Exception as exc:
                     print("❌ 重新連線失敗，停止推論。")
-                    print(e)
+                    print(exc)
                     break
             else:
                 print("🏁 影片已播放完畢，結束推論。")
                 break
 
-        # Step 1: 抽取當前單幀骨架
-        one_frame_skeleton = np.zeros((2, 17), dtype=np.float32)
+        current_sec = frame_idx / fps
+
+        # 平常只保留最近 5 秒；事件成立後再額外收集後 5 秒。
+        pre_event_buffer.append({
+            "time": current_sec,
+            "frame": frame.copy(),
+        })
+
+        if collecting_event:
+            if (
+                not event_frames
+                or current_sec > event_frames[-1]["time"] + 1e-6
+            ):
+                event_frames.append({
+                    "time": current_sec,
+                    "frame": frame.copy(),
+                })
+
+        # --------------------------------------------------------
+        # Step 1：抽取當前單幀骨架
+        # --------------------------------------------------------
+        one_frame_skeleton = np.zeros(
+            (2, 17),
+            dtype=np.float32
+        )
 
         results = yolo_model(frame, verbose=False)
 
-        if len(results) > 0 and results[0].keypoints is not None:
+        if (
+            len(results) > 0
+            and results[0].keypoints is not None
+        ):
             keypoints = results[0].keypoints.xy
 
-            if keypoints is not None and len(keypoints) > 0:
-                person_kpts = keypoints[0].cpu().numpy()
+            if (
+                keypoints is not None
+                and len(keypoints) > 0
+            ):
+                person_kpts = (
+                    keypoints[0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
 
                 if person_kpts.shape[0] >= 17:
-                    one_frame_skeleton[0, :] = person_kpts[:17, 0]
-                    one_frame_skeleton[1, :] = person_kpts[:17, 1]
+                    one_frame_skeleton[0, :] = (
+                        person_kpts[:17, 0]
+                    )
+                    one_frame_skeleton[1, :] = (
+                        person_kpts[:17, 1]
+                    )
 
         skeleton_buffer.append(one_frame_skeleton)
-        current_sec = frame_idx / fps
 
-        # Step 2: 滑動視窗觸發評估
+        # 防止直播長時間執行造成記憶體持續增加
+        max_buffer_size = max(
+            window_size * 2,
+            window_size + stride
+        )
+
+        if len(skeleton_buffer) > max_buffer_size:
+            del skeleton_buffer[:-max_buffer_size]
+
+        # --------------------------------------------------------
+        # Step 2：滑動視窗推論
+        # --------------------------------------------------------
         if (
-            len(skeleton_buffer) >= CONFIG["window_size"]
-            and frame_idx % CONFIG["stride"] == 0
+            len(skeleton_buffer) >= window_size
+            and frame_idx % stride == 0
         ):
             clip = np.stack(
-                skeleton_buffer[-CONFIG["window_size"]:], axis=0
+                skeleton_buffer[-window_size:],
+                axis=0
             )
 
-            clip = np.transpose(clip, (1, 0, 2))
+            clip = np.transpose(
+                clip,
+                (1, 0, 2)
+            )
+
             clip_padded = pad_or_cut_to_300(clip)
 
             current_radar_res = predict_one_clip(
@@ -789,198 +1127,375 @@ def play_and_live_inference(
                 mse_weight
             )
 
-            # Step 3: 報警判斷
-            if current_radar_res["is_unknown"]:
-                if CONFIG["use_consecutive_alert"]:
-                    # 第一次超過閾值，開始累積異常時間
-                    if consecutive_anomaly_start is None:
-                        consecutive_anomaly_start = current_sec
-                        alert_notification_sent = False
+            raw_is_unknown = bool(
+                current_radar_res["is_unknown"]
+            )
 
-                    consecutive_duration = (
-                        current_sec - consecutive_anomaly_start
+            anomaly_vote_history.append(
+                raw_is_unknown
+            )
+
+            if len(anomaly_vote_history) > vote_history_size:
+                del anomaly_vote_history[:-vote_history_size]
+
+            anomaly_votes = int(
+                sum(anomaly_vote_history)
+            )
+            total_votes = len(
+                anomaly_vote_history
+            )
+
+            current_anomaly_ratio = (
+                anomaly_votes / total_votes
+                if total_votes > 0
+                else 0.0
+            )
+
+            enough_history = (
+                total_votes >= min_anomaly_votes
+            )
+
+            voted_anomaly = (
+                enough_history
+                and anomaly_votes >= min_anomaly_votes
+                and current_anomaly_ratio
+                >= anomaly_vote_ratio
+            )
+
+            # 後置 5 秒只記錄「每次滑動視窗」結果，不以每幀重複計票。
+            if (
+                collecting_event
+                and event_collect_until_sec is not None
+                and current_sec <= event_collect_until_sec
+            ):
+                post_event_anomaly_flags.append(voted_anomaly)
+
+            # ----------------------------------------------------
+            # Step 3：異常狀態機
+            # ----------------------------------------------------
+            if detection_state == "normal":
+                consecutive_normal_count = 0
+            
+                if voted_anomaly:
+                    detection_state = "candidate"
+            
+                    # 候選開始時間回推到投票視窗中的第一個異常判斷
+                    first_anomaly_index = next(
+                        (
+                            index
+                            for index, is_anomaly
+                            in enumerate(anomaly_vote_history)
+                            if is_anomaly
+                        ),
+                        len(anomaly_vote_history) - 1
                     )
+            
+                    evaluations_ago = (
+                        len(anomaly_vote_history)
+                        - 1
+                        - first_anomaly_index
+                    )
+            
+                    anomaly_candidate_start = max(
+                        0.0,
+                        current_sec
+                        - evaluations_ago * evaluation_interval_sec
+                    )
+            
+                    candidate_duration = (
+                        current_sec - anomaly_candidate_start
+                    )
+            
+                    print(
+                        f"⏳ [{current_sec:6.2f} 秒] "
+                        f"進入異常候選 | "
+                        f"推估已持續 {candidate_duration:.2f} 秒 | "
+                        f"異常視窗比例 {current_anomaly_ratio:.0%} "
+                        f"({anomaly_votes}/{total_votes}) | "
+                        f"分數 {current_radar_res['combined_score']:.4f}"
+                    )
+            
+                    # 投票紀錄已證明異常持續足夠久，直接正式報警
+                    if candidate_duration >= consecutive_alert_sec:
+                        detection_state = "alert"
+                        anomaly_event_start = anomaly_candidate_start
+                        consecutive_normal_count = 0
 
-                    if consecutive_duration >= CONFIG["consecutive_alert_sec"]:
-                        # 正式建立異常事件，只建立一次
-                        if active_alert_event is None:
-                            active_alert_event = {
-                                # 事件開始時間使用最初超過閾值的時間
-                                "start_sec": consecutive_anomaly_start,
-                                "max_score": current_radar_res["combined_score"],
-                                "nearest_action": current_radar_res[
-                                    "nearest_action_name"
-                                ]
-                            }
-
-                            print(
-                                f"🚨 【異常事件開始】"
-                                f"影片播放到 [ {current_sec:6.2f} 秒 ] "
-                                f"連續異常 {consecutive_duration:.1f} 秒，"
-                                f"綜合異常分："
-                                f"{current_radar_res['combined_score']:.4f} "
-                                f"超過閾值 ({threshold:.4f})！"
-                            )
-
-                        else:
-                            # 異常持續期間更新最高分數
-                            if (
-                                current_radar_res["combined_score"]
-                                > active_alert_event["max_score"]
-                            ):
-                                active_alert_event["max_score"] = (
-                                    current_radar_res["combined_score"]
-                                )
-
-                                active_alert_event["nearest_action"] = (
-                                    current_radar_res["nearest_action_name"]
-                                )
-
-                        # 同一段異常只推播一次
-                        if not alert_notification_sent:
-                            alert_text = build_alert_message(
+                        if not collecting_event:
+                            event_id = f"event_{int(frame_idx):08d}_{int(current_sec * 1000):010d}"
+                            (
+                                event_frames,
+                                event_start_sec,
+                                event_collect_until_sec,
+                            ) = start_event_collection(
+                                pre_event_buffer=pre_event_buffer,
                                 current_sec=current_sec,
-                                consecutive_duration=consecutive_duration,
-                                radar_res=current_radar_res,
-                                threshold=threshold
+                                anomaly_event_start=anomaly_event_start,
                             )
-
-                            push_line_message(line_user_id, alert_text)
-
-                            alert_notification_sent = True
-                            last_alert_time = current_sec
-
-                        else:
+                            post_event_anomaly_flags = [voted_anomaly]
+                            collecting_event = True
                             print(
-                                f"⚠️ [異常事件持續中] "
+                                f"🎞️ 開始收集事件 {event_id} | "
+                                f"前段起點 {event_start_sec:.2f} 秒 | "
+                                f"收集至 {event_collect_until_sec:.2f} 秒"
+                            )
+            
+                        if (
+                            current_sec - last_alert_time
+                            >= alert_cooldown_sec
+                        ):
+                            print(
+                                f"🚨 【確認異常】"
                                 f"{current_sec:6.2f} 秒 | "
-                                f"目前分數："
+                                f"異常持續 {candidate_duration:.1f} 秒 | "
+                                f"異常視窗比例 "
+                                f"{current_anomaly_ratio:.0%} | "
+                                f"綜合分數 "
                                 f"{current_radar_res['combined_score']:.4f}"
                             )
 
+                            print("📹 骨架模型確認疑似異常，等待 VLM 二次判斷。")
+            
+                            last_alert_time = current_sec
+            
+            elif detection_state == "candidate":
+                if voted_anomaly:
+                    candidate_duration = (
+                        current_sec - anomaly_candidate_start
+                        if anomaly_candidate_start is not None
+                        else 0.0
+                    )
+
+                    if (
+                        candidate_duration
+                        >= consecutive_alert_sec
+                    ):
+                        detection_state = "alert"
+                        anomaly_event_start = (
+                            anomaly_candidate_start
+                            if anomaly_candidate_start is not None
+                            else current_sec
+                        )
+                        consecutive_normal_count = 0
+
+                        if not collecting_event:
+                            event_id = f"event_{int(frame_idx):08d}_{int(current_sec * 1000):010d}"
+                            (
+                                event_frames,
+                                event_start_sec,
+                                event_collect_until_sec,
+                            ) = start_event_collection(
+                                pre_event_buffer=pre_event_buffer,
+                                current_sec=current_sec,
+                                anomaly_event_start=anomaly_event_start,
+                            )
+                            post_event_anomaly_flags = [voted_anomaly]
+                            collecting_event = True
+                            print(
+                                f"🎞️ 開始收集事件 {event_id} | "
+                                f"前段起點 {event_start_sec:.2f} 秒 | "
+                                f"收集至 {event_collect_until_sec:.2f} 秒"
+                            )
+
+                        if (
+                            current_sec - last_alert_time
+                            >= alert_cooldown_sec
+                        ):
+                            print(
+                                f"🚨 【確認異常】"
+                                f"{current_sec:6.2f} 秒 | "
+                                f"候選持續 "
+                                f"{candidate_duration:.1f} 秒 | "
+                                f"異常視窗比例 "
+                                f"{current_anomaly_ratio:.0%} | "
+                                f"綜合分數 "
+                                f"{current_radar_res['combined_score']:.4f}"
+                            )
+
+                            print(
+                                "    -> 最接近正常動作："
+                                f"{current_radar_res['nearest_action_name']}"
+                            )
+
+                            last_alert_time = current_sec
+
                     else:
                         print(
-                            f"⏳ [異常累積中] {current_sec:6.2f} 秒 | "
-                            f"已持續 {consecutive_duration:.1f}/"
-                            f"{CONFIG['consecutive_alert_sec']} 秒 "
-                            f"| 分數："
-                            f"{current_radar_res['combined_score']:.4f}"
-                        )
-                else:
-                    # 不使用連續異常模式時，每次符合條件都記錄成一個事件
-                    if current_sec - last_alert_time >= CONFIG["alert_cooldown_sec"]:
-                        print(
-                            f"🚨 【異常爆警!!】影片播放到 "
-                            f"[ {current_sec:6.2f} 秒 ] 🔴 "
-                            f"綜合異常分："
-                            f"{current_radar_res['combined_score']:.4f} "
-                            f"超過閾值 ({threshold:.4f})！"
-                        )
-
-                        print(
-                            f"    -> 最接近正常動作："
-                            f"{current_radar_res['nearest_action_name']}"
-                        )
-
-                        alert_text = build_alert_message(
-                            current_sec=current_sec,
-                            consecutive_duration=0,
-                            radar_res=current_radar_res,
-                            threshold=threshold
-                        )
-
-                        push_line_message(line_user_id, alert_text)
-
-                        alert_events.append({
-                            "start_sec": current_sec,
-                            "end_sec": current_sec,
-                            "duration": 0,
-                            "max_score": current_radar_res["combined_score"],
-                            "nearest_action": current_radar_res[
-                                "nearest_action_name"
-                            ]
-                        })
-
-                        last_alert_time = current_sec
-                    else:
-                        print(
-                            f"⚠️ [持續異常偵測中] "
+                            f"⏳ [異常確認中] "
                             f"{current_sec:6.2f} 秒 | "
-                            f"冷卻中，跳過重複報警。"
+                            f"{candidate_duration:.1f}/"
+                            f"{consecutive_alert_sec:.1f} 秒 | "
+                            f"投票 "
+                            f"{current_anomaly_ratio:.0%}"
                         )
 
-                        print(
-                            f"    -> 最接近正常動作："
-                            f"{current_radar_res['nearest_action_name']}"
-                        )
-
-                        alert_text = build_alert_message(
-                            current_sec=current_sec,
-                            consecutive_duration=0,
-                            radar_res=current_radar_res,
-                            threshold=threshold
-                        )
-
-                        push_line_message(line_user_id, alert_text)
-
-                        last_alert_time = current_sec
-                    # else:
-                    #     print(
-                    #         f"⚠️ [持續異常偵測中] {current_sec:6.2f} 秒 | "
-                    #         f"冷卻中，跳過重複報警。"
-                    #     )
-            else:
-                if consecutive_anomaly_start is not None:
+                else:
                     print(
                         f"✅ [{current_sec:6.2f} 秒] "
-                        f"異常解除，連續異常中斷。"
+                        "異常候選未持續，恢復正常。"
                     )
 
-                # 如果已經正式成立一個異常事件，將它結束並保存
-                if active_alert_event is not None:
-                    active_alert_event["end_sec"] = current_sec
-                    active_alert_event["duration"] = (
-                        active_alert_event["end_sec"]
-                        - active_alert_event["start_sec"]
-                    )
+                    detection_state = "normal"
+                    anomaly_candidate_start = None
 
-                    alert_events.append(active_alert_event)
+            elif detection_state == "alert":
+                if voted_anomaly:
+                    consecutive_normal_count = 0
+
+                    if (
+                        current_sec - last_alert_time
+                        >= alert_cooldown_sec
+                    ):
+                        abnormal_duration = (
+                            current_sec - anomaly_event_start
+                            if anomaly_event_start is not None
+                            else 0.0
+                        )
+
+                        print(
+                            f"🚨 [異常持續] "
+                            f"{current_sec:6.2f} 秒 | "
+                            f"已持續約 "
+                            f"{abnormal_duration:.1f} 秒 | "
+                            f"投票 "
+                            f"{current_anomaly_ratio:.0%}"
+                        )
+
+                        last_alert_time = current_sec
+
+                else:
+                    consecutive_normal_count += 1
 
                     print(
-                        f"📌 已記錄異常事件："
-                        f"{active_alert_event['start_sec']:.2f} 秒"
-                        f" ～ {active_alert_event['end_sec']:.2f} 秒，"
-                        f"共 {active_alert_event['duration']:.2f} 秒，"
-                        f"最高分數 "
-                        f"{active_alert_event['max_score']:.4f}"
+                        f"🔄 [異常解除確認] "
+                        f"{current_sec:6.2f} 秒 | "
+                        f"正常 "
+                        f"{consecutive_normal_count}/"
+                        f"{clear_normal_windows} 個視窗"
                     )
 
-                    active_alert_event = None
+                    if (
+                        consecutive_normal_count
+                        >= clear_normal_windows
+                    ):
+                        print(
+                            f"✅ [{current_sec:6.2f} 秒] "
+                            "異常已解除，恢復正常監控。"
+                        )
 
-                consecutive_anomaly_start = None
-                alert_notification_sent = False
+                        detection_state = "normal"
+                        anomaly_candidate_start = None
+                        anomaly_event_start = None
+                        consecutive_normal_count = 0
+                        anomaly_vote_history.clear()
+                        current_anomaly_ratio = 0.0
 
-        # Step 4: 即時渲染 UI
-        if CONFIG["show_yolo_window"]:
+        # --------------------------------------------------------
+        # Step 4：完成後置 5 秒收集並決定是否保留
+        # --------------------------------------------------------
+        if (
+            collecting_event
+            and event_collect_until_sec is not None
+            and current_sec >= event_collect_until_sec
+        ):
+            try:
+                event_result = finish_event_collection(
+                    event_id=event_id,
+                    event_frames=event_frames,
+                    anomaly_flags=post_event_anomaly_flags,
+                    fps=fps,
+                )
+
+                if event_result is None:
+                    print("✅ 此事件已丟棄，不進行 VLM 分析。")
+
+                else:
+                    frame_paths = event_result["frame_paths"]
+
+                    print(
+                        f"🤖 將 {len(frame_paths)} 張影格交給 Ollama VLM"
+                    )
+
+                    vlm_result = analyze_frames_with_ollama(
+                        frame_paths
+                    )
+
+                    print(
+                        "🧠 Ollama VLM 分析結果：",
+                        vlm_result,
+                    )
+
+                    should_alert = (
+                        vlm_result["is_abnormal"]
+                        and vlm_result["need_alert"]
+                        and vlm_result["confidence"] >= 0.75
+                    )
+
+                    if should_alert:
+                        alert_text = (
+                            "🚨 VLM 確認異常事件\n"
+                            f"類型：{vlm_result['category']}\n"
+                            f"信心度：{vlm_result['confidence']:.0%}\n"
+                            f"描述：{vlm_result['description']}"
+                        )
+
+                        if line_user_id:
+                            push_line_message(
+                                line_user_id,
+                                alert_text,
+                            )
+                        else:
+                            print(
+                                "⚠️ line_user_id 為空，"
+                                "不發送 LINE 警報。"
+                            )
+                    else:
+                        print(
+                            "✅ VLM 判斷未達警報門檻，"
+                            "不發送 LINE。"
+                        )
+
+            except Exception as exc:
+                print(
+                    f"❌ 異常事件處理失敗：{exc}"
+                )
+
+            finally:
+                collecting_event = False
+                event_id = None
+                event_start_sec = None
+                event_collect_until_sec = None
+                event_frames = []
+                post_event_anomaly_flags = []
+
+        # --------------------------------------------------------
+        # Step 5：即時 UI
+        # --------------------------------------------------------
+        if CONFIG.get("show_yolo_window", True):
             display_frame = frame.copy()
+
+            if is_live_like_source:
+                time_text = (
+                    f"Time: {current_sec:.2f}s / LIVE"
+                )
+            else:
+                time_text = (
+                    f"Time: {current_sec:.2f}s / "
+                    f"{total_frames / fps:.2f}s"
+                )
 
             cv2.rectangle(
                 display_frame,
                 (10, 10),
-                (360, 50),
+                (620, 120),
                 (0, 0, 0),
                 -1
             )
 
-            if is_live_like_source:
-                time_text = f"Time: {current_sec:.2f}s / LIVE"
-            else:
-                time_text = f"Time: {current_sec:.2f}s / {total_frames / fps:.2f}s"
-
             cv2.putText(
                 display_frame,
                 time_text,
-                (20, 38),
+                (20, 35),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (255, 255, 255),
@@ -988,142 +1503,133 @@ def play_and_live_inference(
                 cv2.LINE_AA
             )
 
-            if current_radar_res is not None:
-                is_alerting = (
-                    current_radar_res["is_unknown"]
-                    and (
-                        not CONFIG["use_consecutive_alert"]
-                        or (
-                            consecutive_anomaly_start is not None
-                            and current_sec - consecutive_anomaly_start >= CONFIG["consecutive_alert_sec"]
-                        )
-                    )
+            if detection_state == "alert":
+                status_text = (
+                    f"ALARM: UNKNOWN "
+                    f"(vote "
+                    f"{current_anomaly_ratio * 100:.0f}%)"
+                )
+                status_color = (0, 0, 255)
+
+            elif detection_state == "candidate":
+                elapsed = (
+                    current_sec - anomaly_candidate_start
+                    if anomaly_candidate_start is not None
+                    else 0.0
                 )
 
-                if is_alerting:
-                    cv2.rectangle(
-                        display_frame,
-                        (0, 0),
-                        (display_frame.shape[1], 60),
-                        (0, 0, 255),
-                        -1
-                    )
+                status_text = (
+                    f"WARNING: VERIFYING "
+                    f"{elapsed:.1f}/"
+                    f"{consecutive_alert_sec:.1f}s "
+                    f"(vote "
+                    f"{current_anomaly_ratio * 100:.0f}%)"
+                )
+                status_color = (0, 165, 255)
 
-                    cv2.putText(
-                        display_frame,
-                        f"ALARM: UNKNOWN ANOMALY AT {current_sec:.2f}s",
-                        (20, 38),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA
-                    )
+            else:
+                status_text = (
+                    f"STATUS: NORMAL "
+                    f"(vote "
+                    f"{current_anomaly_ratio * 100:.0f}%)"
+                )
+                status_color = (0, 255, 0)
 
-                    cv2.putText(
-                        display_frame,
-                        f"Score: {current_radar_res['combined_score']:.4f} "
-                        f"(Thresh: {threshold:.4f})",
-                        (20, 95),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2,
-                        cv2.LINE_AA
-                    )
+            cv2.putText(
+                display_frame,
+                status_text,
+                (20, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                status_color,
+                2,
+                cv2.LINE_AA
+            )
 
-                    cv2.putText(
-                        display_frame,
-                        f"Nearest: {current_radar_res['nearest_action_name']}",
-                        (20, 125),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2,
-                        cv2.LINE_AA
-                    )
+            if current_radar_res is not None:
+                score_text = (
+                    f"Score: "
+                    f"{current_radar_res['combined_score']:.4f} "
+                    f"/ Thresh: {threshold:.4f} | "
+                    f"Nearest: "
+                    f"{current_radar_res['nearest_action_name']}"
+                )
 
-                elif current_radar_res["is_unknown"] and CONFIG["use_consecutive_alert"]:
-                    elapsed = (
-                        current_sec - consecutive_anomaly_start
-                        if consecutive_anomaly_start is not None
-                        else 0
-                    )
-
-                    cv2.putText(
-                        display_frame,
-                        f"WARNING: Accumulating {elapsed:.1f}/"
-                        f"{CONFIG['consecutive_alert_sec']}s",
-                        (20, 85),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 165, 255),
-                        2,
-                        cv2.LINE_AA
-                    )
-
-                    cv2.putText(
-                        display_frame,
-                        f"Score: {current_radar_res['combined_score']:.4f}",
-                        (20, 115),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 165, 255),
-                        2,
-                        cv2.LINE_AA
-                    )
-
-                else:
-                    cv2.putText(
-                        display_frame,
-                        f"STATUS: NORMAL ({current_radar_res['combined_score']:.4f})",
-                        (20, 85),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 0),
-                        2,
-                        cv2.LINE_AA
-                    )
-
-                    cv2.putText(
-                        display_frame,
-                        f"ACT: {current_radar_res['action_name']} "
-                        f"({current_radar_res['confidence'] * 100:.1f}%)",
-                        (20, 115),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 0),
-                        2,
-                        cv2.LINE_AA
-                    )
+                cv2.putText(
+                    display_frame,
+                    score_text,
+                    (20, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52,
+                    status_color,
+                    2,
+                    cv2.LINE_AA
+                )
 
             cv2.imshow(
                 "ST-CROSR Live Real-Time Radar Monitor",
                 display_frame
             )
 
-            # delay = max(1, int(1000 / fps)) #等33毫秒
-            delay = max(1, int(1000 / fps * 0.5))
-            
+            delay = max(
+                1,
+                int(1000 / fps * 0.5)
+            )
+
             if cv2.waitKey(delay) & 0xFF == ord("q"):
                 print("🛑 使用者手動中斷串流播放。")
                 break
-            
+
         frame_idx += 1
 
-    # 如果影片結束時仍然處於異常狀態，
-    # 將尚未完成的事件補上結束時間
-    final_video_sec = frame_idx / fps
+    # 影片在後置 5 秒完成前結束時，仍以目前已取得的判斷做最後處理。
+    if collecting_event and event_frames:
+        print("⚠️ 影片已結束，使用已收集到的後置影格完成事件判斷。")
+        try:
+            event_result = finish_event_collection(
+                event_id=event_id,
+                event_frames=event_frames,
+                anomaly_flags=post_event_anomaly_flags,
+                fps=fps,
+            )
+            frame_paths = event_result["frame_paths"]
+            vlm_result = analyze_frames_with_ollama(
+                        frame_paths
+                    )
 
-    if active_alert_event is not None:
-        active_alert_event["end_sec"] = final_video_sec
-        active_alert_event["duration"] = (
-            active_alert_event["end_sec"]
-            - active_alert_event["start_sec"]
-        )
-
-        alert_events.append(active_alert_event)
-        active_alert_event = None
+            print(
+                "🧠 Ollama VLM 分析結果：",
+                vlm_result,
+            )
+            should_alert = (
+                vlm_result["is_abnormal"]
+                and vlm_result["need_alert"]
+                and vlm_result["confidence"] >= 0.75
+            )
+            if should_alert:
+                alert_text = (
+                    "🚨 VLM 確認異常事件\n"
+                    f"類型：{vlm_result['category']}\n"
+                    f"信心度：{vlm_result['confidence']:.0%}\n"
+                    f"描述：{vlm_result['description']}"
+                )
+                if line_user_id:
+                    push_line_message(
+                        line_user_id,
+                        alert_text,
+                    )
+                else:
+                    print(
+                        "⚠️ line_user_id 為空，"
+                        "不發送 LINE 警報。"
+                    )
+            else:
+                print(
+                    "✅ VLM 判斷未達警報門檻，"
+                    "不發送 LINE。"
+                )
+        except Exception as exc:
+            print(f"❌ 尾端異常事件保存失敗：{exc}")
 
     cap.release()
     cv2.destroyAllWindows()
