@@ -199,6 +199,92 @@ ACTION_NAMES = {
 }
 
 
+def format_video_time(seconds):
+    """
+    將秒數轉換成適合 LINE 顯示的時間格式。
+    例如：
+    65.3 秒 -> 01:05
+    3665 秒 -> 01:01:05
+    """
+    seconds = max(0, int(seconds))
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    return f"{minutes:02d}:{secs:02d}"
+
+def build_analysis_summary(video_duration, alert_events, stopped_by_user=False):
+    """
+    建立影片分析完成後的 LINE 摘要訊息。
+    """
+
+    if stopped_by_user:
+        title = "⛔ 影片分析已停止"
+    else:
+        title = "✅ 影片分析完成"
+
+    summary_lines = [
+        title,
+        "",
+        f"影片分析長度：{format_video_time(video_duration)}",
+        f"異常事件數量：{len(alert_events)} 次"
+    ]
+
+    if len(alert_events) == 0:
+        summary_lines.extend([
+            "",
+            "本次分析未偵測到符合警報條件的異常事件。"
+        ])
+
+        return "\n".join(summary_lines)
+
+    highest_score = max(
+        event.get("max_score", 0)
+        for event in alert_events
+    )
+
+    summary_lines.append(f"最高異常分數：{highest_score:.4f}")
+    summary_lines.append("")
+    summary_lines.append("📋 異常事件紀錄")
+
+    # 避免 LINE 訊息過長，最多列出前 10 個事件
+    max_display_events = 10
+
+    for index, event in enumerate(
+        alert_events[:max_display_events],
+        start=1
+    ):
+        start_sec = event.get("start_sec", 0)
+        end_sec = event.get("end_sec", start_sec)
+        duration = event.get("duration", end_sec - start_sec)
+        max_score = event.get("max_score", 0)
+        nearest_action = event.get("nearest_action", "unknown")
+
+        summary_lines.extend([
+            "",
+            f"事件 {index}",
+            (
+                f"時間：{format_video_time(start_sec)}"
+                f" ～ {format_video_time(end_sec)}"
+            ),
+            f"持續：約 {duration:.1f} 秒",
+            f"最高分數：{max_score:.4f}",
+            f"最接近正常動作：{nearest_action}"
+        ])
+
+    if len(alert_events) > max_display_events:
+        remaining = len(alert_events) - max_display_events
+
+        summary_lines.extend([
+            "",
+            f"另外還有 {remaining} 個異常事件未顯示。"
+        ])
+
+    return "\n".join(summary_lines)
 # ============================================================
 # 新增：影片來源解析
 # ============================================================
@@ -837,6 +923,13 @@ def play_and_live_inference(
     print(f"通知冷卻: {alert_cooldown_sec:.1f} 秒")
     print("============================================================\n")
 
+    # skeleton_buffer = []
+    # frame_idx = 0
+    # last_alert_time = -9999
+    # current_radar_res = None
+
+    # consecutive_anomaly_start = None
+
     skeleton_buffer = []
     anomaly_vote_history = []
 
@@ -851,6 +944,15 @@ def play_and_live_inference(
     consecutive_normal_count = 0
     current_anomaly_ratio = 0.0
 
+    # 已完成的異常事件
+    alert_events = []
+
+    # 目前正在發生的異常事件
+    # 尚未正式達到 consecutive_alert_sec 時保持 None
+    active_alert_event = None
+
+    # 防止同一段異常重複推播開始警報
+    alert_notification_sent = False
     while True:
         ret, frame = cap.read()
 
@@ -1258,6 +1360,25 @@ def play_and_live_inference(
                 )
 
                 if event_result is not None:
+                    alert_events.append({
+                        "start_sec": event_result["start_time"],
+                        "end_sec": event_result["end_time"],
+                        "duration": (
+                            event_result["end_time"]
+                            - event_result["start_time"]
+                        ),
+                        "max_score": (
+                            current_radar_res["combined_score"]
+                            if current_radar_res is not None
+                            else 0.0
+                        ),
+                        "nearest_action": (
+                            current_radar_res["nearest_action_name"]
+                            if current_radar_res is not None
+                            else "unknown"
+                        ),
+                    })
+
                     print(
                         "🤖 可將以下影格交給 Ollama VLM：",
                         event_result["frame_paths"],
@@ -1414,17 +1535,52 @@ def play_and_live_inference(
     if collecting_event and event_frames:
         print("⚠️ 影片已結束，使用已收集到的後置影格完成事件判斷。")
         try:
-            finish_event_collection(
+            tail_event_result = finish_event_collection(
                 event_id=event_id,
                 event_frames=event_frames,
                 anomaly_flags=post_event_anomaly_flags,
                 fps=fps,
             )
+            if tail_event_result is not None:
+                alert_events.append({
+                    "start_sec": tail_event_result["start_time"],
+                    "end_sec": tail_event_result["end_time"],
+                    "duration": (
+                        tail_event_result["end_time"]
+                        - tail_event_result["start_time"]
+                    ),
+                    "max_score": (
+                        current_radar_res["combined_score"]
+                        if current_radar_res is not None
+                        else 0.0
+                    ),
+                    "nearest_action": (
+                        current_radar_res["nearest_action_name"]
+                        if current_radar_res is not None
+                        else "unknown"
+                    ),
+                })
         except Exception as exc:
             print(f"❌ 尾端異常事件保存失敗：{exc}")
 
+    final_video_sec = frame_idx / fps
+
     cap.release()
     cv2.destroyAllWindows()
+
+    print("\n🏁 影片串流即時掃描結束。")
+
+    # 建立並傳送分析摘要
+    summary_text = build_analysis_summary(
+        video_duration=final_video_sec,
+        alert_events=alert_events
+    )
+
+    print("\n" + "=" * 60)
+    print(summary_text)
+    print("=" * 60 + "\n")
+
+    push_line_message(line_user_id, summary_text)
 
     print("\n🏁 影片串流即時掃描結束。")
 
