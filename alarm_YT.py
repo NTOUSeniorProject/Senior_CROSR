@@ -583,12 +583,16 @@ def start_event_collection(
     pre_event_seconds=PRE_EVENT_SECONDS,
     post_event_seconds=POST_EVENT_SECONDS,
 ):
-    """複製異常前置影格，並設定後置影格的收集截止時間。"""
+    """複製正式確認前 5 秒影格，並設定後 5 秒截止時間。"""
+
     event_start_sec = max(
         0.0,
-        anomaly_event_start - pre_event_seconds,
+        current_sec - pre_event_seconds,
     )
-    event_collect_until_sec = current_sec + post_event_seconds
+
+    event_collect_until_sec = (
+        current_sec + post_event_seconds
+    )
 
     event_frames = [
         {
@@ -599,7 +603,11 @@ def start_event_collection(
         if item["time"] >= event_start_sec
     ]
 
-    return event_frames, event_start_sec, event_collect_until_sec
+    return (
+        event_frames,
+        event_start_sec,
+        event_collect_until_sec,
+    )
 
 
 def should_keep_event(
@@ -608,15 +616,27 @@ def should_keep_event(
     ratio_threshold=POST_ANOMALY_RATIO_THRESHOLD,
 ):
     """依異常確認後的滑動視窗結果，決定是否保留事件。"""
-    total = len(anomaly_flags)
+
+    total_count = len(anomaly_flags)
     anomaly_count = int(sum(anomaly_flags))
-    ratio = anomaly_count / total if total > 0 else 0.0
+
+    anomaly_ratio = (
+        anomaly_count / total_count
+        if total_count > 0
+        else 0.0
+    )
 
     keep = (
         anomaly_count >= min_votes
-        and ratio >= ratio_threshold
+        and anomaly_ratio >= ratio_threshold
     )
-    return keep, anomaly_count, total, ratio
+
+    return (
+        keep,
+        anomaly_count,
+        total_count,
+        anomaly_ratio,
+    )
 
 
 def save_anomaly_event_frames(
@@ -694,17 +714,46 @@ def save_anomaly_event_frames(
     }
 
 
-def finish_event_collection(event_id, event_frames, anomaly_flags, fps):
-    """後 5 秒異常不足時直接丟棄；足夠時才寫入硬碟。"""
-    keep, anomaly_count, total_count, anomaly_ratio = should_keep_event(
-        anomaly_flags
+def finish_event_collection(
+    event_id,
+    event_frames,
+    anomaly_flags,
+    fps,
+    force_partial=False,
+):
+    """
+    完整收集後 5 秒時：
+    至少 2 個異常視窗，且異常比例達 30%。
+
+    影片提早結束時：
+    至少 1 個異常視窗，且異常比例達 50%。
+    """
+
+    if force_partial:
+        min_votes = 1
+        ratio_threshold = 0.5
+    else:
+        min_votes = POST_MIN_ANOMALY_VOTES
+        ratio_threshold = POST_ANOMALY_RATIO_THRESHOLD
+
+    (
+        keep,
+        anomaly_count,
+        total_count,
+        anomaly_ratio,
+    ) = should_keep_event(
+        anomaly_flags=anomaly_flags,
+        min_votes=min_votes,
+        ratio_threshold=ratio_threshold,
     )
 
     if not keep:
         print(
             f"🗑️ 丟棄事件 {event_id} | "
             f"後段異常 {anomaly_count}/{total_count} | "
-            f"比例 {anomaly_ratio:.0%}"
+            f"比例 {anomaly_ratio:.0%} | "
+            f"門檻：至少 {min_votes} 票、"
+            f"比例至少 {ratio_threshold:.0%}"
         )
         return None
 
@@ -713,6 +762,7 @@ def finish_event_collection(event_id, event_frames, anomaly_flags, fps):
         f"後段異常 {anomaly_count}/{total_count} | "
         f"比例 {anomaly_ratio:.0%}"
     )
+
     return save_anomaly_event_frames(
         event_id=event_id,
         event_frames=event_frames,
@@ -1241,13 +1291,10 @@ def play_and_live_inference(
         # --------------------------------------------------------
         # Step 4：完成後置 5 秒收集並決定是否保留
         # --------------------------------------------------------
-        print(
-            collecting_event, event_collect_until_sec, current_sec
-        )
         if (
             collecting_event
             and event_collect_until_sec is not None
-            #and current_sec >= event_collect_until_sec
+            and current_sec >= event_collect_until_sec
         ):
             try:
                 event_result = finish_event_collection(
@@ -1257,37 +1304,60 @@ def play_and_live_inference(
                     fps=fps,
                 )
 
-                if event_result is not None:
+                if event_result is None:
+                    print("✅ 此事件已丟棄，不進行 VLM 分析。")
+
+                else:
+                    frame_paths = event_result["frame_paths"]
+
                     print(
-                        "🤖 可將以下影格交給 Ollama VLM：",
-                        event_result["frame_paths"],
-                    )
-                    vlm_result = analyze_frames_with_ollama(
-                        event_result["frame_paths"]
+                        f"🤖 將 {len(frame_paths)} 張影格交給 Ollama VLM"
                     )
 
-                    if (
+                    vlm_result = analyze_frames_with_ollama(
+                        frame_paths
+                    )
+
+                    print(
+                        "🧠 Ollama VLM 分析結果：",
+                        vlm_result,
+                    )
+
+                    should_alert = (
                         vlm_result["is_abnormal"]
                         and vlm_result["need_alert"]
                         and vlm_result["confidence"] >= 0.75
-                    ):
+                    )
+
+                    if should_alert:
                         alert_text = (
                             "🚨 VLM 確認異常事件\n"
                             f"類型：{vlm_result['category']}\n"
                             f"信心度：{vlm_result['confidence']:.0%}\n"
                             f"描述：{vlm_result['description']}"
                         )
-                    
-                        push_line_message(
-                            line_user_id,
-                            alert_text
+
+                        if line_user_id:
+                            push_line_message(
+                                line_user_id,
+                                alert_text,
+                            )
+                        else:
+                            print(
+                                "⚠️ line_user_id 為空，"
+                                "不發送 LINE 警報。"
+                            )
+                    else:
+                        print(
+                            "✅ VLM 判斷未達警報門檻，"
+                            "不發送 LINE。"
                         )
-                    print(
-                        "🧠 Ollama VLM 分析結果：",
-                        vlm_result
-                    )
+
             except Exception as exc:
-                print(f"❌ 異常事件保存失敗：{exc}")
+                print(
+                    f"❌ 異常事件處理失敗：{exc}"
+                )
+
             finally:
                 collecting_event = False
                 event_id = None
@@ -1414,12 +1484,48 @@ def play_and_live_inference(
     if collecting_event and event_frames:
         print("⚠️ 影片已結束，使用已收集到的後置影格完成事件判斷。")
         try:
-            finish_event_collection(
+            event_result = finish_event_collection(
                 event_id=event_id,
                 event_frames=event_frames,
                 anomaly_flags=post_event_anomaly_flags,
                 fps=fps,
             )
+            frame_paths = event_result["frame_paths"]
+            vlm_result = analyze_frames_with_ollama(
+                        frame_paths
+                    )
+
+            print(
+                "🧠 Ollama VLM 分析結果：",
+                vlm_result,
+            )
+            should_alert = (
+                vlm_result["is_abnormal"]
+                and vlm_result["need_alert"]
+                and vlm_result["confidence"] >= 0.75
+            )
+            if should_alert:
+                alert_text = (
+                    "🚨 VLM 確認異常事件\n"
+                    f"類型：{vlm_result['category']}\n"
+                    f"信心度：{vlm_result['confidence']:.0%}\n"
+                    f"描述：{vlm_result['description']}"
+                )
+                if line_user_id:
+                    push_line_message(
+                        line_user_id,
+                        alert_text,
+                    )
+                else:
+                    print(
+                        "⚠️ line_user_id 為空，"
+                        "不發送 LINE 警報。"
+                    )
+            else:
+                print(
+                    "✅ VLM 判斷未達警報門檻，"
+                    "不發送 LINE。"
+                )
         except Exception as exc:
             print(f"❌ 尾端異常事件保存失敗：{exc}")
 
