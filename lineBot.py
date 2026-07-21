@@ -233,6 +233,11 @@ def create_menu_button_message():
                 },
                 {
                     "type": "message",
+                    "label": "連接 IP Cam",
+                    "text": "連接 IP Cam"
+                },
+                {
+                    "type": "message",
                     "label": "查看狀態",
                     "text": "查看狀態"
                 },
@@ -304,6 +309,20 @@ def callback():
                             "text": "請輸入連結"
                         }
                     ])
+                elif user_text == "連接 IP Cam":
+                    user_states[user_id] = "waiting_for_rtsp"
+
+                    reply_messages(reply_token, [
+                        {
+                            "type": "text",
+                            "text": (
+                                "請輸入 OctoStream 顯示的完整 RTSP 網址。\n\n"
+                                "例如：\n"
+                                "rtsp://192.168.1.105:8554/stream\n\n"
+                                "請確認 iPhone 與執行程式的電腦連接同一個 Wi-Fi。"
+                            )
+                        }
+                    ])
                 elif user_text == "查看狀態":
                     status_text = get_alarm_status(user_id)
 
@@ -344,7 +363,62 @@ def callback():
                                 "text": "停止影片分析失敗，請稍後再試。"
                             }
                         ])
+                elif user_states.get(user_id) == "waiting_for_rtsp":
+                    user_states.pop(user_id, None)
 
+                    rtsp_url = user_text.strip()
+
+                    if not rtsp_url.lower().startswith("rtsp://"):
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "❌ 這不是有效的 RTSP 網址。\n"
+                                    "網址必須以 rtsp:// 開頭。\n\n"
+                                    "請重新選擇「連接 IP Cam」後再輸入。"
+                                )
+                            }
+                        ])
+                        continue
+
+                    print(f"收到使用者 {user_id} 的 RTSP 網址：{rtsp_url}")
+
+                    try:
+                        start_alarm_process(rtsp_url, user_id)
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "📹 已收到 IP Cam 串流網址！\n"
+                                    "正在連接 iPhone 相機並開始即時分析。\n\n"
+                                    "請保持 OctoStream 開啟，且不要鎖定 iPhone 螢幕。"
+                                )
+                            }
+                        ])
+
+                    except RuntimeError as e:
+                        print(f"無法啟動 RTSP 分析：{e}")
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "目前已有影片正在分析。\n"
+                                    "請先選擇「停止分析」，再連接 IP Cam。"
+                                )
+                            }
+                        ])
+
+                    except Exception as e:
+                        print(f"啟動 RTSP 分析失敗：{e}")
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": "IP Cam 連接失敗，請確認 RTSP 網址與網路連線。"
+                            }
+                        ])
                 elif user_states.get(user_id) == "waiting_for_link":
                     user_states.pop(user_id, None)
                     print(f"收到使用者 {user_id} 的影片連結：{user_text}")

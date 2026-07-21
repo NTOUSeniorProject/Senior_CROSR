@@ -471,27 +471,42 @@ def resolve_video_source(source):
 def open_video_capture(source):
     """
     統一建立 OpenCV VideoCapture。
+    支援本機影片、YouTube、HTTP、RTSP 與 RTMP。
     """
 
     resolved_source = resolve_video_source(source)
 
+    is_rtsp = (
+        isinstance(resolved_source, str)
+        and resolved_source.lower().startswith("rtsp://")
+    )
+
     if CONFIG["use_ffmpeg_backend"]:
-        cap = cv2.VideoCapture(resolved_source, cv2.CAP_FFMPEG)
+        cap = cv2.VideoCapture(
+            resolved_source,
+            cv2.CAP_FFMPEG
+        )
     else:
         cap = cv2.VideoCapture(resolved_source)
 
+    # 降低 RTSP 延遲；部分 OpenCV 版本可能不完全支援
+    if is_rtsp:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
     if not cap.isOpened():
         raise FileNotFoundError(
-            f"OpenCV 無法開啟影片來源。\n"
+            "OpenCV 無法開啟影片來源。\n"
             f"原始來源：{source}\n"
             f"解析後來源：{resolved_source}\n\n"
-            "可能原因：\n"
-            "1. OpenCV 沒有 FFmpeg 支援\n"
-            "2. YouTube 串流網址過期\n"
-            "3. 網路不穩\n"
-            "4. 影片格式 OpenCV 不支援\n"
-            "5. 直播目前沒有開播"
+            "請確認：\n"
+            "1. iPhone 與電腦連接同一個 Wi-Fi\n"
+            "2. OctoStream 已開始串流\n"
+            "3. RTSP 網址完整且正確\n"
+            "4. Windows 防火牆沒有阻擋 Python\n"
+            "5. VLC 可以正常播放此 RTSP 網址"
         )
+
+    print(f"✅ OpenCV 已成功開啟：{resolved_source}")
 
     return cap, resolved_source
 
@@ -1007,27 +1022,38 @@ def play_and_live_inference(
         ret, frame = cap.read()
 
         if not ret:
-            if CONFIG.get("is_live_stream", is_live_like_source):
-                print("⚠️ 直播串流暫時中斷，嘗試重新連線...")
+            if CONFIG["is_live_stream"]:
+                print("⚠️ RTSP 串流暫時讀不到畫面，準備重新連線...")
+
                 cap.release()
 
-                try:
-                    cap, resolved_source = open_video_capture(video_path)
-                    print("✅ 重新連線成功，重新建立判斷緩衝區。")
+                reconnect_success = False
 
-                    skeleton_buffer.clear()
-                    anomaly_vote_history.clear()
+                for attempt in range(1, 6):
+                    print(f"🔄 第 {attempt}/5 次重新連線...")
 
-                    detection_state = "normal"
-                    anomaly_candidate_start = None
-                    anomaly_event_start = None
-                    consecutive_normal_count = 0
-                    current_anomaly_ratio = 0.0
-                    continue
+                    try:
+                        time.sleep(2)
 
-                except Exception as exc:
-                    print("❌ 重新連線失敗，停止推論。")
-                    print(exc)
+                        cap, resolved_source = open_video_capture(video_path)
+
+                        # 先測試是否真的讀得到一幀
+                        test_ret, test_frame = cap.read()
+
+                        if test_ret and test_frame is not None:
+                            print("✅ RTSP 重新連線成功。")
+                            frame = test_frame
+                            ret = True
+                            reconnect_success = True
+                            break
+
+                        cap.release()
+
+                    except Exception as e:
+                        print(f"⚠️ 第 {attempt} 次重新連線失敗：{e}")
+
+                if not reconnect_success:
+                    print("❌ RTSP 連續重新連線失敗，停止推論。")
                     break
             else:
                 print("🏁 影片已播放完畢，結束推論。")
@@ -1652,9 +1678,21 @@ def play_and_live_inference(
 
 
 def main(video_path=None, line_user_id=None):
-    # 有傳入影片來源（例如從 LineBot 收到的連結）就覆蓋 CONFIG 預設值
+    # 有傳入影片來源，就覆蓋 CONFIG 預設值
     if video_path:
+        video_path = video_path.strip()
         CONFIG["video_path"] = video_path
+
+        # RTSP、RTMP、m3u8 都視為直播來源
+        CONFIG["is_live_stream"] = (
+            video_path.lower().startswith(("rtsp://", "rtmp://"))
+            or ".m3u8" in video_path.lower()
+        )
+
+        if CONFIG["is_live_stream"]:
+            print("✅ 已判斷為即時串流來源")
+        else:
+            print("✅ 已判斷為一般影片來源")
 
     if line_user_id:
         print(f"✅ 已接收 LINE user_id：{line_user_id}")
