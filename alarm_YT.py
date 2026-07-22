@@ -12,6 +12,7 @@ from ultralytics import YOLO
 from dotenv import load_dotenv
 from collections import deque
 from VLM_check import analyze_frames_with_ollama
+from movement_detection import MovementDetector
 
 
 load_dotenv()
@@ -986,6 +987,13 @@ def play_and_live_inference(
     frame_idx = 0
     last_alert_time = -9999.0
     current_radar_res = None
+    final_video_sec = 0.0
+    stopped_by_user = False
+
+    # MOG2 偶爾一兩幀判定無移動時，不要立刻停止 YOLO。
+    # 偵測到移動後，至少再維持 2 秒的骨架偵測。
+    motion_grace_frames = max(1, int(fps * 2.0))
+    motion_hold_remaining = 0
 
     # normal -> candidate -> alert
     detection_state = "normal"
@@ -1003,10 +1011,22 @@ def play_and_live_inference(
 
     # 防止同一段異常重複推播開始警報
     alert_notification_sent = False
+
+    motion_detector = MovementDetector(
+            history=500,
+            var_threshold=25,
+            detect_shadows=True,
+            min_motion_ratio=0.01,
+            warmup_frames=max(30, int(fps * 2)),
+            confirm_frames=3,
+            resize_width=320,
+    )
+
     while True:
         ret, frame = cap.read()
 
-        if not ret:
+        # 1. 必須先確認 frame 有效，才能 frame.copy() 或交給 MOG2。
+        if not ret or frame is None:
             if CONFIG.get("is_live_stream", is_live_like_source):
                 print("⚠️ 直播串流暫時中斷，嘗試重新連線...")
                 cap.release()
@@ -1017,30 +1037,34 @@ def play_and_live_inference(
 
                     skeleton_buffer.clear()
                     anomaly_vote_history.clear()
+                    pre_event_buffer.clear()
 
                     detection_state = "normal"
                     anomaly_candidate_start = None
                     anomaly_event_start = None
                     consecutive_normal_count = 0
                     current_anomaly_ratio = 0.0
+                    motion_hold_remaining = 0
                     continue
 
                 except Exception as exc:
                     print("❌ 重新連線失敗，停止推論。")
                     print(exc)
                     break
-            else:
-                print("🏁 影片已播放完畢，結束推論。")
-                break
+
+            print("🏁 影片已播放完畢，結束推論。")
+            break
 
         current_sec = frame_idx / fps
+        final_video_sec = current_sec
 
-        # 平常只保留最近 5 秒；事件成立後再額外收集後 5 秒。
+        # 2. 所有影格都保存到前置 5 秒緩衝區，每幀只加入一次。
         pre_event_buffer.append({
             "time": current_sec,
             "frame": frame.copy(),
         })
 
+        # 3. 已進入異常事件收集時，即使人物不動也要保存後置畫面。
         if collecting_event:
             if (
                 not event_frames
@@ -1051,15 +1075,108 @@ def play_and_live_inference(
                     "frame": frame.copy(),
                 })
 
-        # --------------------------------------------------------
-        # Step 1：抽取當前單幀骨架
-        # --------------------------------------------------------
-        one_frame_skeleton = np.zeros(
-            (2, 17),
-            dtype=np.float32
+        # 4. 必須在「無移動 continue」之前完成事件，否則跌倒後靜止
+        #    會讓事件永遠無法走到 VLM 分析。
+        if (
+            collecting_event
+            and event_collect_until_sec is not None
+            and current_sec >= event_collect_until_sec
+        ):
+            try:
+                event_result = finish_event_collection(
+                    event_id=event_id,
+                    event_frames=event_frames,
+                    anomaly_flags=post_event_anomaly_flags,
+                    fps=fps,
+                )
+
+                if event_result is None:
+                    print("✅ 此事件已丟棄，不進行 VLM 分析。")
+                else:
+                    frame_paths = event_result["frame_paths"]
+                    print(f"🤖 將 {len(frame_paths)} 張影格交給 Ollama VLM")
+
+                    vlm_result = analyze_frames_with_ollama(frame_paths)
+                    print("🧠 Ollama VLM 分析結果：", vlm_result)
+
+                    should_alert = (
+                        vlm_result["is_abnormal"]
+                        and vlm_result["need_alert"]
+                        and vlm_result["confidence"] >= 0.75
+                    )
+
+                    if should_alert:
+                        alert_text = (
+                            "🚨 VLM 確認異常事件\n"
+                            f"類型：{vlm_result['category']}\n"
+                            f"信心度：{vlm_result['confidence']:.0%}\n"
+                            f"描述：{vlm_result['description']}"
+                        )
+                        push_line_message(line_user_id, alert_text)
+                    else:
+                        print("✅ VLM 判斷未達警報門檻，不發送 LINE。")
+
+            except Exception as exc:
+                print(f"❌ 異常事件處理失敗：{exc}")
+
+            finally:
+                collecting_event = False
+                event_id = None
+                event_start_sec = None
+                event_collect_until_sec = None
+                event_frames = []
+                post_event_anomaly_flags = []
+
+        # 5. MOG2 動作判斷；加入 2 秒 grace period，避免骨架視窗被切碎。
+        raw_has_movement, motion_ratio, fg_mask = (
+            motion_detector.check_whether_move(frame)
         )
 
-        results = yolo_model(frame, verbose=False)
+        if raw_has_movement:
+            motion_hold_remaining = motion_grace_frames
+        elif motion_hold_remaining > 0:
+            motion_hold_remaining -= 1
+
+        has_movement = raw_has_movement or motion_hold_remaining > 0
+        # 6. 沒移動就不跑 YOLO，但 UI 照常更新
+        if not has_movement:
+            if CONFIG.get("show_yolo_window", True):
+                display_frame = frame.copy()
+                cv2.putText(
+                    display_frame,
+                    f"NO MOVEMENT ({motion_ratio:.2%})",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow(
+                    "ST-CROSR Live Real-Time Radar Monitor",
+                    display_frame,
+                )
+                cv2.imshow(
+                    "MOG2 Foreground Mask",
+                    fg_mask,
+                )
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    stopped_by_user = True
+                    break
+                
+            frame_idx += 1
+            continue
+        
+        # 7. 有動作才跑 YOLO、ST-CROSR
+        one_frame_skeleton = np.zeros(
+            (2, 17),
+            dtype=np.float32,
+        )
+        results = yolo_model(
+            frame,
+            verbose=False,
+        )
+
 
         if (
             len(results) > 0
@@ -1391,84 +1508,6 @@ def play_and_live_inference(
                         current_anomaly_ratio = 0.0
 
         # --------------------------------------------------------
-        # Step 4：完成後置 5 秒收集並決定是否保留
-        # --------------------------------------------------------
-        if (
-            collecting_event
-            and event_collect_until_sec is not None
-            and current_sec >= event_collect_until_sec
-        ):
-            try:
-                event_result = finish_event_collection(
-                    event_id=event_id,
-                    event_frames=event_frames,
-                    anomaly_flags=post_event_anomaly_flags,
-                    fps=fps,
-                )
-
-                if event_result is None:
-                    print("✅ 此事件已丟棄，不進行 VLM 分析。")
-
-                else:
-                    frame_paths = event_result["frame_paths"]
-
-                    print(
-                        f"🤖 將 {len(frame_paths)} 張影格交給 Ollama VLM"
-                    )
-
-                    vlm_result = analyze_frames_with_ollama(
-                        frame_paths
-                    )
-
-                    print(
-                        "🧠 Ollama VLM 分析結果：",
-                        vlm_result,
-                    )
-
-                    should_alert = (
-                        vlm_result["is_abnormal"]
-                        and vlm_result["need_alert"]
-                        and vlm_result["confidence"] >= 0.75
-                    )
-
-                    if should_alert:
-                        alert_text = (
-                            "🚨 VLM 確認異常事件\n"
-                            f"類型：{vlm_result['category']}\n"
-                            f"信心度：{vlm_result['confidence']:.0%}\n"
-                            f"描述：{vlm_result['description']}"
-                        )
-
-                        if line_user_id:
-                            push_line_message(
-                                line_user_id,
-                                alert_text,
-                            )
-                        else:
-                            print(
-                                "⚠️ line_user_id 為空，"
-                                "不發送 LINE 警報。"
-                            )
-                    else:
-                        print(
-                            "✅ VLM 判斷未達警報門檻，"
-                            "不發送 LINE。"
-                        )
-
-            except Exception as exc:
-                print(
-                    f"❌ 異常事件處理失敗：{exc}"
-                )
-
-            finally:
-                collecting_event = False
-                event_id = None
-                event_start_sec = None
-                event_collect_until_sec = None
-                event_frames = []
-                post_event_anomaly_flags = []
-
-        # --------------------------------------------------------
         # Step 5：即時 UI
         # --------------------------------------------------------
         if CONFIG.get("show_yolo_window", True):
@@ -1578,6 +1617,7 @@ def play_and_live_inference(
 
             if cv2.waitKey(delay) & 0xFF == ord("q"):
                 print("🛑 使用者手動中斷串流播放。")
+                stopped_by_user = True
                 break
 
         frame_idx += 1
@@ -1591,43 +1631,46 @@ def play_and_live_inference(
                 event_frames=event_frames,
                 anomaly_flags=post_event_anomaly_flags,
                 fps=fps,
+                force_partial=True,
             )
-            frame_paths = event_result["frame_paths"]
-            vlm_result = analyze_frames_with_ollama(
-                        frame_paths
-                    )
 
-            print(
-                "🧠 Ollama VLM 分析結果：",
-                vlm_result,
-            )
-            should_alert = (
-                vlm_result["is_abnormal"]
-                and vlm_result["need_alert"]
-                and vlm_result["confidence"] >= 0.75
-            )
-            if should_alert:
-                alert_text = (
-                    "🚨 VLM 確認異常事件\n"
-                    f"類型：{vlm_result['category']}\n"
-                    f"信心度：{vlm_result['confidence']:.0%}\n"
-                    f"描述：{vlm_result['description']}"
+            if event_result is None:
+                print("✅ 尾端事件未達保留門檻，不進行 VLM 分析。")
+            else:
+                frame_paths = event_result["frame_paths"]
+                vlm_result = analyze_frames_with_ollama(frame_paths)
+
+                print(
+                    "🧠 Ollama VLM 分析結果：",
+                    vlm_result,
                 )
-                if line_user_id:
-                    push_line_message(
-                        line_user_id,
-                        alert_text,
+                should_alert = (
+                    vlm_result["is_abnormal"]
+                    and vlm_result["need_alert"]
+                    and vlm_result["confidence"] >= 0.75
+                )
+                if should_alert:
+                    alert_text = (
+                        "🚨 VLM 確認異常事件\n"
+                        f"類型：{vlm_result['category']}\n"
+                        f"信心度：{vlm_result['confidence']:.0%}\n"
+                        f"描述：{vlm_result['description']}"
                     )
+                    if line_user_id:
+                        push_line_message(
+                            line_user_id,
+                            alert_text,
+                        )
+                    else:
+                        print(
+                            "⚠️ line_user_id 為空，"
+                            "不發送 LINE 警報。"
+                        )
                 else:
                     print(
-                        "⚠️ line_user_id 為空，"
-                        "不發送 LINE 警報。"
+                        "✅ VLM 判斷未達警報門檻，"
+                        "不發送 LINE。"
                     )
-            else:
-                print(
-                    "✅ VLM 判斷未達警報門檻，"
-                    "不發送 LINE。"
-                )
         except Exception as exc:
             print(f"❌ 尾端異常事件保存失敗：{exc}")
 
@@ -1636,19 +1679,6 @@ def play_and_live_inference(
 
     print("\n🏁 影片串流即時掃描結束。")
 
-    # 建立並傳送分析摘要
-    summary_text = build_analysis_summary(
-        video_duration=final_video_sec,
-        alert_events=alert_events
-    )
-
-    print("\n" + "=" * 60)
-    print(summary_text)
-    print("=" * 60 + "\n")
-
-    push_line_message(line_user_id, summary_text)
-
-    print("\n🏁 影片串流即時掃描結束。")
 
 
 def main(video_path=None, line_user_id=None):
