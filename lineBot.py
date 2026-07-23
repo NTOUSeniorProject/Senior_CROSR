@@ -6,6 +6,7 @@ import base64
 import hashlib
 import requests
 import subprocess
+import time
 
 from flask import Flask, request, abort
 from dotenv import load_dotenv
@@ -20,25 +21,166 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 # 記錄每位使用者目前的狀態，例如 "waiting_for_link" 表示正在等待輸入連結
 user_states = {}
 
+# 記錄每位使用者目前執行中的影片分析程序
+# 格式：
+# running_processes[user_id] = {
+#     "process": subprocess.Popen,
+#     "video_url": "影片連結"
+# }
+running_processes = {}
+
 # alarm_YT.py 的 checkpoint 路徑是相對路徑，必須以專案根目錄為工作目錄執行
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def start_alarm_process(video_url: str):
+def start_alarm_process(video_url: str, user_id: str):
     """
-    在背景啟動 alarm_YT.py 進行影片推論，不阻塞 webhook 回應。
+    在背景啟動 alarm_YT.py。
+    同時保存程序、影片連結與開始時間。
     """
     script_path = os.path.join(BASE_DIR, "alarm_YT.py")
 
+    old_task = running_processes.get(user_id)
+
+    if old_task is not None:
+        old_process = old_task.get("process")
+
+        if old_process is not None and old_process.poll() is None:
+            raise RuntimeError("目前已有影片正在分析")
+
+        running_processes.pop(user_id, None)
+
     process = subprocess.Popen(
-        [sys.executable, script_path, video_url],
+        [sys.executable, script_path, video_url, user_id],
         cwd=BASE_DIR
     )
 
-    print(f"已啟動 alarm_YT.py（PID: {process.pid}），影片來源：{video_url}")
+    running_processes[user_id] = {
+        "process": process,
+        "video_url": video_url,
+        "started_at": time.time()
+    }
+
+    print(f"LINE user_id：{user_id}")
+    print(f"已啟動 alarm_YT.py（PID: {process.pid}）")
+    print(f"影片來源：{video_url}")
+
     return process
 
 
+def stop_alarm_process(user_id: str):
+    """
+    停止指定 LINE 使用者目前正在執行的影片分析。
+
+    回傳：
+    True  -> 成功停止
+    False -> 目前沒有正在執行的分析
+    """
+    task = running_processes.get(user_id)
+
+    if task is None:
+        return False
+
+    process = task.get("process")
+
+    # 程序不存在或早已結束
+    if process is None or process.poll() is not None:
+        running_processes.pop(user_id, None)
+        return False
+
+    print(f"準備停止使用者 {user_id} 的影片分析，PID：{process.pid}")
+
+    try:
+        # 先嘗試正常終止
+        process.terminate()
+
+        try:
+            # 最多等待 5 秒
+            process.wait(timeout=5)
+            print(f"✅ 已停止影片分析，PID：{process.pid}")
+
+        except subprocess.TimeoutExpired:
+            # 無法正常停止時強制結束
+            print(f"⚠️ 程序未正常停止，強制結束 PID：{process.pid}")
+            process.kill()
+            process.wait(timeout=5)
+
+    except Exception as e:
+        print(f"❌ 停止影片分析失敗：{e}")
+        raise
+
+    finally:
+        running_processes.pop(user_id, None)
+
+    return True
+
+def format_elapsed_time(seconds: float) -> str:
+    """
+    將秒數轉成容易閱讀的時間格式。
+    """
+    seconds = max(0, int(seconds))
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+
+    if hours > 0:
+        return f"{hours} 小時 {minutes} 分 {secs} 秒"
+
+    if minutes > 0:
+        return f"{minutes} 分 {secs} 秒"
+
+    return f"{secs} 秒"
+
+
+def get_alarm_status(user_id: str) -> str:
+    """
+    查詢指定使用者的影片分析狀態。
+    """
+    task = running_processes.get(user_id)
+
+    if task is None:
+        return "目前沒有影片分析紀錄。"
+
+    process = task.get("process")
+    video_url = task.get("video_url", "未知")
+    started_at = task.get("started_at", time.time())
+
+    elapsed_seconds = time.time() - started_at
+    elapsed_text = format_elapsed_time(elapsed_seconds)
+
+    if process is None:
+        running_processes.pop(user_id, None)
+        return "目前沒有正在執行的影片分析。"
+
+    return_code = process.poll()
+
+    # poll() 回傳 None，表示程序仍在執行
+    if return_code is None:
+        return (
+            "🟢 影片分析中\n"
+            f"已執行時間：{elapsed_text}\n"
+            f"程序編號：{process.pid}\n"
+            f"影片來源：{video_url}"
+        )
+
+    # return code 為 0，表示正常結束
+    if return_code == 0:
+        running_processes.pop(user_id, None)
+
+        return (
+            "✅ 影片分析已完成\n"
+            f"總執行時間：{elapsed_text}"
+        )
+
+    # 非 0 通常表示異常退出
+    running_processes.pop(user_id, None)
+
+    return (
+        "❌ 影片分析已異常停止\n"
+        f"執行時間：{elapsed_text}\n"
+        f"錯誤代碼：{return_code}"
+    )
 def verify_signature(body: bytes, signature: str) -> bool:
     """
     驗證 Webhook 是否真的是 LINE 傳來的。
@@ -88,6 +230,21 @@ def create_menu_button_message():
                     "type": "message",
                     "label": "上傳影片",
                     "text": "上傳影片"
+                },
+                {
+                    "type": "message",
+                    "label": "連接 IP Cam",
+                    "text": "連接 IP Cam"
+                },
+                {
+                    "type": "message",
+                    "label": "查看狀態",
+                    "text": "查看狀態"
+                },
+                {
+                    "type": "message",
+                    "label": "停止分析",
+                    "text": "停止分析"
                 }
                 # {
                 #     "type": "message",
@@ -152,21 +309,141 @@ def callback():
                             "text": "請輸入連結"
                         }
                     ])
+                elif user_text == "連接 IP Cam":
+                    user_states[user_id] = "waiting_for_rtsp"
 
+                    reply_messages(reply_token, [
+                        {
+                            "type": "text",
+                            "text": (
+                                "請輸入 OctoStream 顯示的完整 RTSP 網址。\n\n"
+                                "例如：\n"
+                                "rtsp://192.168.1.105:8554/stream\n\n"
+                                "請確認 iPhone 與執行程式的電腦連接同一個 Wi-Fi。"
+                            )
+                        }
+                    ])
+                elif user_text == "查看狀態":
+                    status_text = get_alarm_status(user_id)
+
+                    reply_messages(reply_token, [
+                        {
+                            "type": "text",
+                            "text": status_text
+                        }
+                    ])
+                elif user_text == "停止分析":
+                    # 同時取消等待連結的狀態
+                    user_states.pop(user_id, None)
+
+                    try:
+                        stopped = stop_alarm_process(user_id)
+
+                        if stopped:
+                            reply_messages(reply_token, [
+                                {
+                                    "type": "text",
+                                    "text": "⛔ 已停止目前的影片分析。"
+                                }
+                            ])
+                        else:
+                            reply_messages(reply_token, [
+                                {
+                                    "type": "text",
+                                    "text": "目前沒有正在執行的影片分析。"
+                                }
+                            ])
+
+                    except Exception as e:
+                        print(f"停止影片分析失敗：{e}")
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": "停止影片分析失敗，請稍後再試。"
+                            }
+                        ])
+                elif user_states.get(user_id) == "waiting_for_rtsp":
+                    user_states.pop(user_id, None)
+
+                    rtsp_url = user_text.strip()
+
+                    if not rtsp_url.lower().startswith("rtsp://"):
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "❌ 這不是有效的 RTSP 網址。\n"
+                                    "網址必須以 rtsp:// 開頭。\n\n"
+                                    "請重新選擇「連接 IP Cam」後再輸入。"
+                                )
+                            }
+                        ])
+                        continue
+
+                    print(f"收到使用者 {user_id} 的 RTSP 網址：{rtsp_url}")
+
+                    try:
+                        start_alarm_process(rtsp_url, user_id)
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "📹 已收到 IP Cam 串流網址！\n"
+                                    "正在連接 iPhone 相機並開始即時分析。\n\n"
+                                    "請保持 OctoStream 開啟，且不要鎖定 iPhone 螢幕。"
+                                )
+                            }
+                        ])
+
+                    except RuntimeError as e:
+                        print(f"無法啟動 RTSP 分析：{e}")
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "目前已有影片正在分析。\n"
+                                    "請先選擇「停止分析」，再連接 IP Cam。"
+                                )
+                            }
+                        ])
+
+                    except Exception as e:
+                        print(f"啟動 RTSP 分析失敗：{e}")
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": "IP Cam 連接失敗，請確認 RTSP 網址與網路連線。"
+                            }
+                        ])
                 elif user_states.get(user_id) == "waiting_for_link":
                     user_states.pop(user_id, None)
                     print(f"收到使用者 {user_id} 的影片連結：{user_text}")
 
                     try:
-                        start_alarm_process(user_text)
+                        start_alarm_process(user_text, user_id)
                         reply_messages(reply_token, [
                             {
                                 "type": "text",
                                 "text": "已收到連結，開始分析影片！"
                             }
                         ])
+                    except RuntimeError as e:
+                        print(f"無法啟動分析：{e}")
+
+                        reply_messages(reply_token, [
+                            {
+                                "type": "text",
+                                "text": "目前已有影片正在分析，請先選擇「停止分析」，再上傳新的影片。"
+                            }
+                        ])
+
                     except Exception as e:
                         print(f"啟動 alarm_YT.py 失敗：{e}")
+
                         reply_messages(reply_token, [
                             {
                                 "type": "text",
