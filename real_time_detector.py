@@ -1,6 +1,7 @@
 import time
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from constants import CONFIG, PRE_EVENT_SECONDS, POST_EVENT_SECONDS
 from video_source import open_video_capture
@@ -9,6 +10,39 @@ from event_handler import start_event_collection, finish_event_collection
 from line_notifier import push_line_message
 from VLM_check import analyze_frames_with_ollama
 from movement_detection import MovementDetector
+
+
+def _analyze_event_with_vlm(frame_paths, line_user_id):
+    """在背景執行 VLM 判讀，避免阻塞即時影片分析。"""
+    print(f"🤖 將 {len(frame_paths)} 張影格交給 Ollama VLM")
+    vlm_result = analyze_frames_with_ollama(frame_paths)
+    print("🧠 Ollama VLM 分析結果：", vlm_result)
+
+    should_alert = (
+        vlm_result["is_abnormal"]
+        and vlm_result["need_alert"]
+        and vlm_result["confidence"] >= 0.75
+    )
+
+    if not should_alert:
+        print("✅ VLM 判斷未達警報門檻，不發送 LINE。")
+        return
+
+    alert_text = (
+        "🚨 VLM 確認異常事件\n"
+        f"類型：{vlm_result['category']}\n"
+        f"信心度：{vlm_result['confidence']:.0%}\n"
+        f"描述：{vlm_result['description']}"
+    )
+    push_line_message(line_user_id, alert_text)
+
+
+def _report_background_vlm_result(future):
+    """集中回報背景 VLM 工作中未處理的例外。"""
+    try:
+        future.result()
+    except Exception as exc:
+        print(f"❌ 背景 VLM 分析失敗：{exc}")
 
 
 def play_and_live_inference(
@@ -128,6 +162,10 @@ def play_and_live_inference(
     current_radar_res = None
     final_video_sec = 0.0
     stopped_by_user = False
+    vlm_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="vlm-analysis",
+    )
 
     motion_grace_frames = max(1, int(fps * 2.0))
     motion_hold_remaining = 0
@@ -237,27 +275,15 @@ def play_and_live_inference(
                     print("✅ 此事件已丟棄，不進行 VLM 分析。")
                 else:
                     frame_paths = event_result["frame_paths"]
-                    print(f"🤖 將 {len(frame_paths)} 張影格交給 Ollama VLM")
-
-                    vlm_result = analyze_frames_with_ollama(frame_paths)
-                    print("🧠 Ollama VLM 分析結果：", vlm_result)
-
-                    should_alert = (
-                        vlm_result["is_abnormal"]
-                        and vlm_result["need_alert"]
-                        and vlm_result["confidence"] >= 0.75
+                    vlm_future = vlm_executor.submit(
+                        _analyze_event_with_vlm,
+                        frame_paths,
+                        line_user_id,
                     )
-
-                    if should_alert:
-                        alert_text = (
-                            "🚨 VLM 確認異常事件\n"
-                            f"類型：{vlm_result['category']}\n"
-                            f"信心度：{vlm_result['confidence']:.0%}\n"
-                            f"描述：{vlm_result['description']}"
-                        )
-                        push_line_message(line_user_id, alert_text)
-                    else:
-                        print("✅ VLM 判斷未達警報門檻，不發送 LINE。")
+                    vlm_future.add_done_callback(
+                        _report_background_vlm_result
+                    )
+                    print("▶️ VLM 已在背景執行，持續進行影片分析。")
 
             except Exception as exc:
                 print(f"❌ 異常事件處理失敗：{exc}")
@@ -801,5 +827,6 @@ def play_and_live_inference(
 
     cap.release()
     cv2.destroyAllWindows()
+    vlm_executor.shutdown(wait=False)
 
     print("\n🏁 影片串流即時掃描結束。")
