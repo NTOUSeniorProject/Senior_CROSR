@@ -11,5 +11,6 @@
 *.onnx
 *.ckpt
 *.env
+*.pyc
 abnormal_events
 checkpoints_20260602_2237
