@@ -19,6 +19,10 @@ RELAY_HOST = os.getenv("VLM_RELAY_HOST", "0.0.0.0")
 RELAY_PORT = int(os.getenv("VLM_RELAY_PORT", "8002"))
 CONNECT_TIMEOUT = float(os.getenv("VLM_RELAY_CONNECT_TIMEOUT", "10"))
 READ_TIMEOUT = float(os.getenv("VLM_RELAY_READ_TIMEOUT", "300"))
+USE_ENV_PROXY = os.getenv(
+    "VLM_RELAY_USE_ENV_PROXY",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
 
 ALLOWED_PATHS = {
     "models": {"GET"},
@@ -26,6 +30,9 @@ ALLOWED_PATHS = {
 }
 
 app = Flask(__name__)
+upstream_session = requests.Session()
+# 預設與可成功直連的 remoteTest.py 相同，採用 PC-lab 環境代理設定。
+upstream_session.trust_env = USE_ENV_PROXY
 
 
 def is_authorized() -> bool:
@@ -48,16 +55,17 @@ def forward(path: str) -> Response:
         return jsonify({"error": "中繼站驗證失敗"}), 401
 
     try:
-        upstream_response = requests.request(
+        upstream_response = upstream_session.request(
             method=request.method,
             url=f"{UPSTREAM_BASE_URL}/{path}",
             headers=upstream_headers(),
             data=request.get_data() if request.method == "POST" else None,
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
         )
-    except requests.ConnectionError:
+    except requests.ConnectionError as error:
         return jsonify({
-            "error": f"PC-lab 無法連線大型主機 {UPSTREAM_BASE_URL}"
+            "error": f"PC-lab 無法連線大型主機 {UPSTREAM_BASE_URL}",
+            "detail": str(error),
         }), 502
     except requests.Timeout:
         return jsonify({"error": "大型主機 VLM 回應逾時"}), 504
@@ -83,7 +91,7 @@ def forward(path: str) -> Response:
 @app.get("/health")
 def health():
     try:
-        response = requests.get(
+        response = upstream_session.get(
             f"{UPSTREAM_BASE_URL}/models",
             headers=upstream_headers(),
             timeout=(CONNECT_TIMEOUT, 30),
@@ -116,4 +124,5 @@ def relay(path: str):
 if __name__ == "__main__":
     print(f"VLM relay listening on http://{RELAY_HOST}:{RELAY_PORT}")
     print(f"Forwarding to {UPSTREAM_BASE_URL}")
+    print(f"Use environment proxy: {USE_ENV_PROXY}")
     app.run(host=RELAY_HOST, port=RELAY_PORT, debug=False, threaded=True)

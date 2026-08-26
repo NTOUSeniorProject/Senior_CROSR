@@ -1,4 +1,4 @@
-"""從本機經由 PC-lab 中繼站測試大型主機 VLM。
+"""在 PC-lab 直接測試大型主機 VLM。
 
 文字測試：
     python remoteTest.py
@@ -21,8 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_BASE_URL = "http://26.184.142.137:8002/v1"
-DIRECT_BASE_URL = "http://192.168.50.51:8001/v1"
+DEFAULT_BASE_URL = "http://192.168.50.51:8001/v1"
 DEFAULT_MODEL = "OpenGVLab/InternVL3-78B-AWQ"
 
 
@@ -147,15 +146,12 @@ def run_completion(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="從本機經由 PC-lab 呼叫大型主機的 OpenAI-compatible VLM。"
+        description="在 PC-lab 直接呼叫大型主機的 OpenAI-compatible VLM。"
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("VLM_BASE_URL", DEFAULT_BASE_URL),
-        help=(
-            f"OpenAI-compatible API 根網址（預設中繼站：{DEFAULT_BASE_URL}；"
-            f"PC-lab 直連大型主機可用 {DIRECT_BASE_URL}）"
-        ),
+        default=os.getenv("LARGE_VLM_BASE_URL", DEFAULT_BASE_URL),
+        help=f"OpenAI-compatible API 根網址（預設：{DEFAULT_BASE_URL}）",
     )
     parser.add_argument(
         "--model",
@@ -164,14 +160,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--api-key",
-        default=os.getenv(
-            "VLM_RELAY_TOKEN",
-            os.getenv("LARGE_VLM_API_KEY", "EMPTY"),
-        ),
-        help=(
-            "Bearer token；中繼模式讀取 VLM_RELAY_TOKEN，"
-            "PC-lab 直連模式可使用 LARGE_VLM_API_KEY"
-        ),
+        default=os.getenv("LARGE_VLM_API_KEY", "EMPTY"),
+        help="API Key；預設讀取 LARGE_VLM_API_KEY，未設定時使用 EMPTY",
     )
     parser.add_argument(
         "--image",
