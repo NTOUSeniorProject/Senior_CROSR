@@ -1,13 +1,25 @@
 import base64
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import requests
+from dotenv import load_dotenv
 
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-OLLAMA_MODEL = "blaifa/InternVL3_5:8B"
+load_dotenv()
+
+DEFAULT_OLLAMA_BASE_URL = "http://26.184.142.137:11434"
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL",
+    DEFAULT_OLLAMA_BASE_URL,
+).rstrip("/")
+OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "blaifa/InternVL3_5:8B",
+)
 
 ABNORMAL_RESULT_SCHEMA = {
     "type": "object",
@@ -134,7 +146,7 @@ def analyze_frames_with_ollama(
     except requests.ConnectionError as error:
         raise RuntimeError(
             "無法連線到 Ollama，請確認 Ollama 已啟動，"
-            "並可存取 http://127.0.0.1:11434"
+            f"並可存取 {OLLAMA_BASE_URL}"
         ) from error
 
     except requests.Timeout as error:
