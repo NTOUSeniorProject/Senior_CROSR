@@ -1,5 +1,6 @@
 import base64
 import json
+import mimetypes
 import os
 from pathlib import Path
 from typing import Any
@@ -10,16 +11,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_OLLAMA_BASE_URL = "http://26.184.142.137:11434"
-OLLAMA_BASE_URL = os.getenv(
-    "OLLAMA_BASE_URL",
-    DEFAULT_OLLAMA_BASE_URL,
+DEFAULT_VLM_BASE_URL = "http://26.184.142.137:8002/v1"
+VLM_BASE_URL = os.getenv(
+    "VLM_BASE_URL",
+    DEFAULT_VLM_BASE_URL,
 ).rstrip("/")
-OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
-OLLAMA_MODEL = os.getenv(
-    "OLLAMA_MODEL",
-    "blaifa/InternVL3_5:8B",
+VLM_CHAT_URL = f"{VLM_BASE_URL}/chat/completions"
+VLM_MODEL = os.getenv(
+    "VLM_MODEL",
+    "OpenGVLab/InternVL3-78B-AWQ",
 )
+VLM_RELAY_TOKEN = os.getenv("VLM_RELAY_TOKEN", "")
 
 ABNORMAL_RESULT_SCHEMA = {
     "type": "object",
@@ -92,52 +94,65 @@ VLM_PROMPT = """
 """
 
 
-def image_to_base64(image_path: str) -> str:
+def image_to_data_url(image_path: str) -> str:
     path = Path(image_path)
 
-    if not path.exists():
+    if not path.is_file():
         raise FileNotFoundError(f"找不到圖片：{image_path}")
 
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     with path.open("rb") as file:
-        return base64.b64encode(file.read()).decode("utf-8")
+        encoded = base64.b64encode(file.read()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def analyze_frames_with_ollama(
     frame_paths: list[str],
-    model: str = OLLAMA_MODEL,
+    model: str = VLM_MODEL,
     timeout: int = 180,
 ) -> dict[str, Any]:
+    """透過 PC-lab 中繼站呼叫 OpenAI-compatible 大型 VLM。"""
     if not frame_paths:
         raise ValueError("沒有提供任何影格")
 
-    encoded_images = [
-        image_to_base64(frame_path)
-        for frame_path in frame_paths
+    content = [
+        {
+            "type": "text",
+            "text": (
+                VLM_PROMPT
+                + "\n請只輸出 JSON 物件，不要加入 Markdown 標記。"
+            ),
+        }
     ]
+    content.extend(
+        {
+            "type": "image_url",
+            "image_url": {"url": image_to_data_url(frame_path)},
+        }
+        for frame_path in frame_paths
+    )
 
     payload = {
         "model": model,
         "stream": False,
-        "format": ABNORMAL_RESULT_SCHEMA,
         "messages": [
             {
                 "role": "user",
-                "content": VLM_PROMPT,
-                "images": encoded_images
+                "content": content,
             }
         ],
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 300,
-            "num_ctx": 32768
-        },
-        # 推論結束後保留模型 5 分鐘，避免每次重新載入
-        "keep_alive": "5m"
+        "temperature": 0.1,
+        "max_tokens": 300,
+        "response_format": {"type": "json_object"},
     }
+    headers = {"Content-Type": "application/json"}
+    if VLM_RELAY_TOKEN:
+        headers["Authorization"] = f"Bearer {VLM_RELAY_TOKEN}"
 
     try:
         response = requests.post(
-            OLLAMA_URL,
+            VLM_CHAT_URL,
+            headers=headers,
             json=payload,
             timeout=timeout
         )
@@ -145,29 +160,39 @@ def analyze_frames_with_ollama(
 
     except requests.ConnectionError as error:
         raise RuntimeError(
-            "無法連線到 Ollama，請確認 Ollama 已啟動，"
-            f"並可存取 {OLLAMA_BASE_URL}"
+            "無法連線到 PC-lab VLM 中繼站，"
+            f"請確認可存取 {VLM_BASE_URL}"
         ) from error
 
     except requests.Timeout as error:
         raise RuntimeError(
-            f"Ollama 推論超過 {timeout} 秒"
+            f"大型 VLM 推論超過 {timeout} 秒"
         ) from error
 
     except requests.HTTPError as error:
         raise RuntimeError(
-            f"Ollama API 發生錯誤："
+            f"OpenAI-compatible VLM API 發生錯誤："
             f"{response.status_code} {response.text}"
         ) from error
 
     response_data = response.json()
-    raw_content = response_data["message"]["content"]
+    try:
+        raw_content = response_data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise RuntimeError(
+            f"大型 VLM 回應缺少 choices[0].message.content：{response_data}"
+        ) from error
 
     try:
-        result = json.loads(raw_content)
+        cleaned_content = raw_content.strip()
+        if cleaned_content.startswith("```"):
+            cleaned_content = cleaned_content.removeprefix("```json")
+            cleaned_content = cleaned_content.removeprefix("```")
+            cleaned_content = cleaned_content.removesuffix("```").strip()
+        result = json.loads(cleaned_content)
     except json.JSONDecodeError as error:
         raise RuntimeError(
-            f"Ollama 回傳的內容不是合法 JSON：{raw_content}"
+            f"大型 VLM 回傳的內容不是合法 JSON：{raw_content}"
         ) from error
 
     return {
@@ -176,7 +201,8 @@ def analyze_frames_with_ollama(
         "confidence": float(result["confidence"]),
         "description": str(result["description"]),
         "need_alert": bool(result["need_alert"]),
-        "total_duration": response_data.get("total_duration"),
-        "load_duration": response_data.get("load_duration"),
-        "eval_count": response_data.get("eval_count")
+        "total_duration": None,
+        "load_duration": None,
+        "eval_count": response_data.get("usage", {}).get("completion_tokens"),
+        "usage": response_data.get("usage"),
     }
