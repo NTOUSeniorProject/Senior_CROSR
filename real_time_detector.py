@@ -15,22 +15,10 @@ from threading import Lock, Thread, Event
 from queue import Queue, Empty, Full
 
 class LatestFrameReader:
-    """
-    直播專用影格讀取器。
-
-    背景執行緒會持續讀取 Camera，
-    Queue 永遠只保存最新的一張 frame。
-
-    如果主程式 YOLO 處理太慢，
-    舊 frame 直接丟掉，不會累積延遲。
-    """
 
     def __init__(self, cap):
         self.cap = cap
-
-        # 最多只保存一張
         self.queue = Queue(maxsize=1)
-
         self.stop_event = Event()
 
         self.thread = Thread(
@@ -46,11 +34,26 @@ class LatestFrameReader:
 
             ret, frame = self.cap.read()
 
+            # 串流讀取失敗
             if not ret or frame is None:
+
+                # 清掉 Queue 舊資料
+                if self.queue.full():
+                    try:
+                        self.queue.get_nowait()
+                    except Empty:
+                        pass
+
+                # 用 None 通知主程式：
+                # 串流真的斷了
+                try:
+                    self.queue.put_nowait(None)
+                except Full:
+                    pass
+
                 break
 
-            # 如果裡面已經有舊 frame
-            # 直接把舊的刪掉
+            # 舊 frame 不要留
             if self.queue.full():
 
                 try:
@@ -58,7 +61,7 @@ class LatestFrameReader:
                 except Empty:
                     pass
 
-            # 放入最新 frame
+            # 永遠只放最新 frame
             try:
                 self.queue.put_nowait(frame)
             except Full:
@@ -70,6 +73,10 @@ class LatestFrameReader:
             frame = self.queue.get(timeout=timeout)
 
         except Empty:
+            return False, None
+
+        # None 代表背景 Reader 已經斷線
+        if frame is None:
             return False, None
 
         return True, frame
@@ -299,29 +306,67 @@ def play_and_live_inference(
             ret, frame = cap.read()
 
         if not ret or frame is None:
-            if CONFIG.get("is_live_stream", is_live_like_source):
+
+            should_reconnect = (
+                is_live_like_source
+                or CONFIG.get("is_live_stream", False)
+            )
+
+            if should_reconnect:
+
                 print("⚠️ 直播串流暫時中斷，嘗試重新連線...")
 
-                cap.release()
+                # ==========================================
+                # 1. 先停止舊的 LatestFrameReader
+                # ==========================================
+                if live_reader is not None:
+                    live_reader.stop()
+                    live_reader = None
+
+                # ==========================================
+                # 2. 釋放舊的 VideoCapture
+                # ==========================================
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
                 reconnect_success = False
 
+                # ==========================================
+                # 3. 最多重新連線 5 次
+                # ==========================================
                 for attempt in range(1, 6):
+
                     print(f"🔄 第 {attempt}/5 次重新連線...")
 
                     try:
                         time.sleep(2)
 
-                        cap, resolved_source = open_video_capture(video_path)
+                        new_cap, new_resolved_source = open_video_capture(
+                            video_path
+                        )
 
-                        test_ret, test_frame = cap.read()
+                        # 先直接測一張
+                        test_ret, test_frame = new_cap.read()
 
                         if test_ret and test_frame is not None:
+
                             print("✅ RTSP 重新連線成功。")
-                            frame = test_frame
-                            ret = True
+
+                            # 換成新的 cap
+                            cap = new_cap
+                            resolved_source = new_resolved_source
+
+                            # ==================================
+                            # 很重要：
+                            # 新 cap 一定要建立新的 Reader
+                            # ==================================
+                            live_reader = LatestFrameReader(cap)
+
                             reconnect_success = True
 
+                            # 清掉舊串流留下來的辨識狀態
                             skeleton_buffer.clear()
                             anomaly_vote_history.clear()
                             pre_event_buffer.clear()
@@ -332,17 +377,52 @@ def play_and_live_inference(
                             consecutive_normal_count = 0
                             current_anomaly_ratio = 0.0
                             motion_hold_remaining = 0
+
+                            # 如果斷線時正在收集異常事件，
+                            # 不要把重連後的畫面接到舊事件後面
+                            collecting_event = False
+                            event_id = None
+                            event_start_sec = None
+                            event_collect_until_sec = None
+                            event_frames = []
+                            post_event_anomaly_flags = []
+
                             break
 
-                        cap.release()
+                        else:
+                            print(
+                                f"⚠️ 第 {attempt} 次已連上，"
+                                "但讀不到有效影格。"
+                            )
+
+                            new_cap.release()
 
                     except Exception as e:
-                        print(f"⚠️ 第 {attempt} 次重新連線失敗：{e}")
 
+                        print(
+                            f"⚠️ 第 {attempt} 次重新連線失敗：{e}"
+                        )
+
+                # ==========================================
+                # 4. 五次全部失敗
+                # ==========================================
                 if not reconnect_success:
-                    print("❌ RTSP 連續重新連線失敗，停止推論。")
+
+                    print(
+                        "❌ RTSP 連續重新連線失敗，停止推論。"
+                    )
+
                     break
+
+                # ==========================================
+                # 很重要
+                # 重新連線後直接回 while 最上面
+                # 讓新的 LatestFrameReader 提供最新影格
+                # ==========================================
+                continue
+
             else:
+
                 print("🏁 影片已播放完畢，結束推論。")
                 break
 
