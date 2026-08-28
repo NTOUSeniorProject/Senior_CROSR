@@ -11,6 +11,8 @@ from event_handler import start_event_collection, finish_event_collection
 from line_notifier import push_line_message
 from VLM_check import analyze_frames_with_ollama
 from movement_detection import MovementDetector
+from threading import Lock, Thread, Event
+from queue import Queue, Empty, Full
 
 class LatestFrameReader:
     """
