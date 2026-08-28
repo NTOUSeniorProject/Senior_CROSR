@@ -12,6 +12,68 @@ from line_notifier import push_line_message
 from VLM_check import analyze_frames_with_ollama
 from movement_detection import MovementDetector
 
+class LatestFrameReader:
+    """
+    直播專用影格讀取器。
+
+    背景執行緒會持續讀取 Camera，
+    Queue 永遠只保存最新的一張 frame。
+
+    如果主程式 YOLO 處理太慢，
+    舊 frame 直接丟掉，不會累積延遲。
+    """
+
+    def __init__(self, cap):
+        self.cap = cap
+
+        # 最多只保存一張
+        self.queue = Queue(maxsize=1)
+
+        self.stop_event = Event()
+
+        self.thread = Thread(
+            target=self._reader,
+            daemon=True
+        )
+
+        self.thread.start()
+
+    def _reader(self):
+
+        while not self.stop_event.is_set():
+
+            ret, frame = self.cap.read()
+
+            if not ret or frame is None:
+                break
+
+            # 如果裡面已經有舊 frame
+            # 直接把舊的刪掉
+            if self.queue.full():
+
+                try:
+                    self.queue.get_nowait()
+                except Empty:
+                    pass
+
+            # 放入最新 frame
+            try:
+                self.queue.put_nowait(frame)
+            except Full:
+                pass
+
+    def read(self, timeout=2.0):
+
+        try:
+            frame = self.queue.get(timeout=timeout)
+
+        except Empty:
+            return False, None
+
+        return True, frame
+
+    def stop(self):
+        self.stop_event.set()
 
 class _PendingVLMEvents:
     """以執行緒安全方式追蹤已提交但尚未完成的 VLM 事件。"""
@@ -120,6 +182,12 @@ def play_and_live_inference(
         or total_frames <= 0
     )
 
+    live_reader = None
+
+    if is_live_like_source:
+        print("📡 使用最新影格模式，避免直播延遲累積")
+        live_reader = LatestFrameReader(cap)
+
     window_size = int(CONFIG.get("window_size", 60))
     stride = max(1, int(CONFIG.get("stride", 5)))
 
@@ -219,7 +287,14 @@ def play_and_live_inference(
     )
 
     while True:
-        ret, frame = cap.read()
+        # ret, frame = cap.read()
+        if live_reader is not None:
+
+            ret, frame = live_reader.read()
+
+        else:
+
+            ret, frame = cap.read()
 
         if not ret or frame is None:
             if CONFIG.get("is_live_stream", is_live_like_source):

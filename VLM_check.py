@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_OLLAMA_BASE_URL = "http://26.184.142.137:11434"
+DEFAULT_OLLAMA_BASE_URL = "http://26.247.236.14:11434"
 OLLAMA_BASE_URL = os.getenv(
     "OLLAMA_BASE_URL",
     DEFAULT_OLLAMA_BASE_URL,
@@ -18,7 +18,7 @@ OLLAMA_BASE_URL = os.getenv(
 OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
 OLLAMA_MODEL = os.getenv(
     "OLLAMA_MODEL",
-    "blaifa/InternVL3_5:8B",
+    "blaifa/InternVL3_5:4B",
 )
 
 ABNORMAL_RESULT_SCHEMA = {
