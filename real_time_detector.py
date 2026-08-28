@@ -505,8 +505,42 @@ def play_and_live_inference(
 
         has_movement = raw_has_movement or motion_hold_remaining > 0
         if not has_movement:
+
+            # ==========================================
+            # No Movement → 直接解除異常狀態
+            # ==========================================
+            if detection_state != "normal":
+                print(
+                    f"✅ [{current_sec:6.2f} 秒] "
+                    f"偵測到 NO MOVEMENT，"
+                    f"直接解除異常狀態 ({detection_state} → normal)"
+                )
+
+            detection_state = "normal"
+
+            # 清除異常狀態
+            anomaly_candidate_start = None
+            anomaly_event_start = None
+            consecutive_normal_count = 0
+
+            # 清除之前的異常投票
+            anomaly_vote_history.clear()
+            current_anomaly_ratio = 0.0
+
+            # 清除之前 CROSR 的結果
+            current_radar_res = None
+
+            # 很重要：
+            # 不要讓恢復移動後還吃到之前的異常骨架
+            skeleton_buffer.clear()
+
+            # ==========================================
+            # 原本顯示 NO MOVEMENT 的程式
+            # ==========================================
             if CONFIG.get("show_yolo_window", True):
+
                 display_frame = frame.copy()
+
                 cv2.putText(
                     display_frame,
                     f"NO MOVEMENT ({motion_ratio:.2%})",
@@ -517,17 +551,20 @@ def play_and_live_inference(
                     2,
                     cv2.LINE_AA,
                 )
+
                 cv2.imshow(
                     "ST-CROSR Live Real-Time Radar Monitor",
                     display_frame,
                 )
+
                 cv2.imshow(
                     "MOG2 Foreground Mask",
                     fg_mask,
                 )
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    stopped_by_user = True
-                    break
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stopped_by_user = True
+                break
 
             frame_idx += 1
             continue
