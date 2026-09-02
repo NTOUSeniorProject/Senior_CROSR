@@ -10,16 +10,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_OLLAMA_BASE_URL = "http://26.184.142.137:11434"
+DEFAULT_OLLAMA_BASE_URL = "http://26.239.83.199:11434"
+DEFAULT_SECONDARY_OLLAMA_BASE_URL = "http://26.184.142.137:11434"
 OLLAMA_BASE_URL = os.getenv(
     "OLLAMA_BASE_URL",
     DEFAULT_OLLAMA_BASE_URL,
 ).rstrip("/")
 OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
-OLLAMA_MODEL = os.getenv(
-    "OLLAMA_MODEL",
-    "blaifa/InternVL3_5:8B",
-)
+SECONDARY_OLLAMA_BASE_URL = os.getenv(
+    "SECONDARY_OLLAMA_BASE_URL",
+    DEFAULT_SECONDARY_OLLAMA_BASE_URL,
+).rstrip("/")
+SECONDARY_OLLAMA_URL = f"{SECONDARY_OLLAMA_BASE_URL}/api/chat"
+OLLAMA_MODEL = "blaifa/InternVL3_5:4B"
+SECONDARY_OLLAMA_MODEL = "blaifa/InternVL3_5:8B"
+
+# 0：只使用第一組 VLM
+# 1：第一組判定無異常時，再將相同資料送至第二組 VLM
+DOUBLE_VLM = 0
 
 ABNORMAL_RESULT_SCHEMA = {
     "type": "object",
@@ -102,13 +110,73 @@ def image_to_base64(image_path: str) -> str:
         return base64.b64encode(file.read()).decode("utf-8")
 
 
+def _request_ollama(
+    url: str,
+    base_url: str,
+    payload: dict[str, Any],
+    timeout: int,
+    vlm_group: int,
+) -> dict[str, Any]:
+    """送出一次 Ollama VLM 請求，並整理成系統使用的結果格式。"""
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+
+    except requests.ConnectionError as error:
+        raise RuntimeError(
+            f"無法連線到第 {vlm_group} 組 Ollama，請確認 Ollama 已啟動，"
+            f"並可存取 {base_url}"
+        ) from error
+
+    except requests.Timeout as error:
+        raise RuntimeError(
+            f"第 {vlm_group} 組 Ollama 推論超過 {timeout} 秒"
+        ) from error
+
+    except requests.HTTPError as error:
+        raise RuntimeError(
+            f"第 {vlm_group} 組 Ollama API 發生錯誤："
+            f"{response.status_code} {response.text}"
+        ) from error
+
+    response_data = response.json()
+    raw_content = response_data["message"]["content"]
+
+    try:
+        result = json.loads(raw_content)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"第 {vlm_group} 組 Ollama 回傳的內容不是合法 JSON："
+            f"{raw_content}"
+        ) from error
+
+    return {
+        "is_abnormal": bool(result["is_abnormal"]),
+        "category": str(result["category"]),
+        "confidence": float(result["confidence"]),
+        "description": str(result["description"]),
+        "need_alert": bool(result["need_alert"]),
+        "total_duration": response_data.get("total_duration"),
+        "load_duration": response_data.get("load_duration"),
+        "eval_count": response_data.get("eval_count"),
+        "vlm_group": vlm_group,
+    }
+
+
 def analyze_frames_with_ollama(
     frame_paths: list[str],
     model: str = OLLAMA_MODEL,
     timeout: int = 180,
+    double_vlm: int = DOUBLE_VLM,
 ) -> dict[str, Any]:
     if not frame_paths:
         raise ValueError("沒有提供任何影格")
+    if double_vlm not in (0, 1):
+        raise ValueError("double_vlm 只能是 0 或 1")
 
     encoded_images = [
         image_to_base64(frame_path)
@@ -135,48 +203,32 @@ def analyze_frames_with_ollama(
         "keep_alive": "5m"
     }
 
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json=payload,
-            timeout=timeout
+    primary_result = _request_ollama(
+        url=OLLAMA_URL,
+        base_url=OLLAMA_BASE_URL,
+        payload=payload,
+        timeout=timeout,
+        vlm_group=1,
+    )
+    primary_result["double_vlm_triggered"] = False
+
+    if double_vlm == 1 and not primary_result["is_abnormal"]:
+        print(
+            "[double_vlm] 第一組 VLM 判定無異常，"
+            "將相同的圖片與提示詞送往第二組 VLM。"
         )
-        response.raise_for_status()
+        secondary_payload = {
+            **payload,
+            "model": SECONDARY_OLLAMA_MODEL,
+        }
+        secondary_result = _request_ollama(
+            url=SECONDARY_OLLAMA_URL,
+            base_url=SECONDARY_OLLAMA_BASE_URL,
+            payload=secondary_payload,
+            timeout=timeout,
+            vlm_group=2,
+        )
+        secondary_result["double_vlm_triggered"] = True
+        return secondary_result
 
-    except requests.ConnectionError as error:
-        raise RuntimeError(
-            "無法連線到 Ollama，請確認 Ollama 已啟動，"
-            f"並可存取 {OLLAMA_BASE_URL}"
-        ) from error
-
-    except requests.Timeout as error:
-        raise RuntimeError(
-            f"Ollama 推論超過 {timeout} 秒"
-        ) from error
-
-    except requests.HTTPError as error:
-        raise RuntimeError(
-            f"Ollama API 發生錯誤："
-            f"{response.status_code} {response.text}"
-        ) from error
-
-    response_data = response.json()
-    raw_content = response_data["message"]["content"]
-
-    try:
-        result = json.loads(raw_content)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(
-            f"Ollama 回傳的內容不是合法 JSON：{raw_content}"
-        ) from error
-
-    return {
-        "is_abnormal": bool(result["is_abnormal"]),
-        "category": str(result["category"]),
-        "confidence": float(result["confidence"]),
-        "description": str(result["description"]),
-        "need_alert": bool(result["need_alert"]),
-        "total_duration": response_data.get("total_duration"),
-        "load_duration": response_data.get("load_duration"),
-        "eval_count": response_data.get("eval_count")
-    }
+    return primary_result
