@@ -11,7 +11,78 @@ from event_handler import start_event_collection, finish_event_collection
 from line_notifier import push_line_message
 from VLM_check import analyze_frames_with_ollama
 from movement_detection import MovementDetector
+from threading import Lock, Thread, Event
+from queue import Queue, Empty, Full
 
+class LatestFrameReader:
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.queue = Queue(maxsize=1)
+        self.stop_event = Event()
+
+        self.thread = Thread(
+            target=self._reader,
+            daemon=True
+        )
+
+        self.thread.start()
+
+    def _reader(self):
+
+        while not self.stop_event.is_set():
+
+            ret, frame = self.cap.read()
+
+            # 串流讀取失敗
+            if not ret or frame is None:
+
+                # 清掉 Queue 舊資料
+                if self.queue.full():
+                    try:
+                        self.queue.get_nowait()
+                    except Empty:
+                        pass
+
+                # 用 None 通知主程式：
+                # 串流真的斷了
+                try:
+                    self.queue.put_nowait(None)
+                except Full:
+                    pass
+
+                break
+
+            # 舊 frame 不要留
+            if self.queue.full():
+
+                try:
+                    self.queue.get_nowait()
+                except Empty:
+                    pass
+
+            # 永遠只放最新 frame
+            try:
+                self.queue.put_nowait(frame)
+            except Full:
+                pass
+
+    def read(self, timeout=2.0):
+
+        try:
+            frame = self.queue.get(timeout=timeout)
+
+        except Empty:
+            return False, None
+
+        # None 代表背景 Reader 已經斷線
+        if frame is None:
+            return False, None
+
+        return True, frame
+
+    def stop(self):
+        self.stop_event.set()
 
 class _PendingVLMEvents:
     """以執行緒安全方式追蹤已提交但尚未完成的 VLM 事件。"""
@@ -120,6 +191,12 @@ def play_and_live_inference(
         or total_frames <= 0
     )
 
+    live_reader = None
+
+    if is_live_like_source:
+        print("📡 使用最新影格模式，避免直播延遲累積")
+        live_reader = LatestFrameReader(cap)
+
     window_size = int(CONFIG.get("window_size", 60))
     stride = max(1, int(CONFIG.get("stride", 5)))
 
@@ -143,6 +220,19 @@ def play_and_live_inference(
 
     alert_cooldown_sec = float(
         CONFIG.get("alert_cooldown_sec", 30.0)
+    )
+
+    startup_anomaly_detection_sec = max(
+        0.0,
+        float(CONFIG.get("startup_anomaly_detection_sec", 10.0)),
+    )
+    movement_anomaly_interval_sec = max(
+        0.1,
+        float(CONFIG.get("movement_anomaly_interval_sec", 300.0)),
+    )
+    movement_anomaly_duration_sec = max(
+        0.1,
+        float(CONFIG.get("movement_anomaly_duration_sec", 60.0)),
     )
 
     evaluation_interval_sec = stride / fps
@@ -180,6 +270,15 @@ def play_and_live_inference(
     print(f"候選異常維持: {consecutive_alert_sec:.1f} 秒")
     print(f"解除條件: 連續 {clear_normal_windows} 個正常視窗")
     print(f"通知冷卻: {alert_cooldown_sec:.1f} 秒")
+    print(
+        f"啟動時強制異常偵測: "
+        f"{startup_anomaly_detection_sec:.1f} 秒"
+    )
+    print(
+        "Movement Detection 中仍有人物時: "
+        f"每 {movement_anomaly_interval_sec / 60:.1f} 分鐘"
+        f"啟動 {movement_anomaly_duration_sec / 60:.1f} 分鐘異常偵測"
+    )
     print("============================================================\n")
 
     skeleton_buffer = []
@@ -198,6 +297,21 @@ def play_and_live_inference(
 
     motion_grace_frames = max(1, int(fps * 2.0))
     motion_hold_remaining = 0
+
+    mode_started_at = time.monotonic()
+    startup_anomaly_until = (
+        mode_started_at + startup_anomaly_detection_sec
+    )
+    person_presence_memory_sec = max(
+        3.0,
+        motion_grace_frames / fps + 1.0,
+    )
+    last_person_seen_at = None
+    movement_detection_mode = False
+    movement_mode_person_present = False
+    next_periodic_anomaly_at = None
+    periodic_anomaly_until = None
+    periodic_person_seen = False
 
     detection_state = "normal"
     anomaly_candidate_start = None
@@ -219,32 +333,77 @@ def play_and_live_inference(
     )
 
     while True:
-        ret, frame = cap.read()
+        # ret, frame = cap.read()
+        if live_reader is not None:
+
+            ret, frame = live_reader.read()
+
+        else:
+
+            ret, frame = cap.read()
 
         if not ret or frame is None:
-            if CONFIG.get("is_live_stream", is_live_like_source):
+
+            should_reconnect = (
+                is_live_like_source
+                or CONFIG.get("is_live_stream", False)
+            )
+
+            if should_reconnect:
+
                 print("⚠️ 直播串流暫時中斷，嘗試重新連線...")
 
-                cap.release()
+                # ==========================================
+                # 1. 先停止舊的 LatestFrameReader
+                # ==========================================
+                if live_reader is not None:
+                    live_reader.stop()
+                    live_reader = None
+
+                # ==========================================
+                # 2. 釋放舊的 VideoCapture
+                # ==========================================
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
                 reconnect_success = False
 
+                # ==========================================
+                # 3. 最多重新連線 5 次
+                # ==========================================
                 for attempt in range(1, 6):
+
                     print(f"🔄 第 {attempt}/5 次重新連線...")
 
                     try:
                         time.sleep(2)
 
-                        cap, resolved_source = open_video_capture(video_path)
+                        new_cap, new_resolved_source = open_video_capture(
+                            video_path
+                        )
 
-                        test_ret, test_frame = cap.read()
+                        # 先直接測一張
+                        test_ret, test_frame = new_cap.read()
 
                         if test_ret and test_frame is not None:
+
                             print("✅ RTSP 重新連線成功。")
-                            frame = test_frame
-                            ret = True
+
+                            # 換成新的 cap
+                            cap = new_cap
+                            resolved_source = new_resolved_source
+
+                            # ==================================
+                            # 很重要：
+                            # 新 cap 一定要建立新的 Reader
+                            # ==================================
+                            live_reader = LatestFrameReader(cap)
+
                             reconnect_success = True
 
+                            # 清掉舊串流留下來的辨識狀態
                             skeleton_buffer.clear()
                             anomaly_vote_history.clear()
                             pre_event_buffer.clear()
@@ -255,17 +414,58 @@ def play_and_live_inference(
                             consecutive_normal_count = 0
                             current_anomaly_ratio = 0.0
                             motion_hold_remaining = 0
+                            last_person_seen_at = None
+                            movement_detection_mode = False
+                            movement_mode_person_present = False
+                            next_periodic_anomaly_at = None
+                            periodic_anomaly_until = None
+                            periodic_person_seen = False
+
+                            # 如果斷線時正在收集異常事件，
+                            # 不要把重連後的畫面接到舊事件後面
+                            collecting_event = False
+                            event_id = None
+                            event_start_sec = None
+                            event_collect_until_sec = None
+                            event_frames = []
+                            post_event_anomaly_flags = []
+
                             break
 
-                        cap.release()
+                        else:
+                            print(
+                                f"⚠️ 第 {attempt} 次已連上，"
+                                "但讀不到有效影格。"
+                            )
+
+                            new_cap.release()
 
                     except Exception as e:
-                        print(f"⚠️ 第 {attempt} 次重新連線失敗：{e}")
 
+                        print(
+                            f"⚠️ 第 {attempt} 次重新連線失敗：{e}"
+                        )
+
+                # ==========================================
+                # 4. 五次全部失敗
+                # ==========================================
                 if not reconnect_success:
-                    print("❌ RTSP 連續重新連線失敗，停止推論。")
+
+                    print(
+                        "❌ RTSP 連續重新連線失敗，停止推論。"
+                    )
+
                     break
+
+                # ==========================================
+                # 很重要
+                # 重新連線後直接回 while 最上面
+                # 讓新的 LatestFrameReader 提供最新影格
+                # ==========================================
+                continue
+
             else:
+
                 print("🏁 影片已播放完畢，結束推論。")
                 break
 
@@ -347,30 +547,166 @@ def play_and_live_inference(
             motion_hold_remaining -= 1
 
         has_movement = raw_has_movement or motion_hold_remaining > 0
-        if not has_movement:
+        mode_now = time.monotonic()
+        startup_anomaly_active = mode_now < startup_anomaly_until
+
+        if (
+            periodic_anomaly_until is not None
+            and mode_now >= periodic_anomaly_until
+        ):
+            periodic_anomaly_until = None
+            if periodic_person_seen:
+                print(
+                    "[mode] 定期異常偵測結束；畫面仍有人物，"
+                    "保留下一次排程。"
+                )
+            else:
+                movement_mode_person_present = False
+                next_periodic_anomaly_at = None
+                print(
+                    "[mode] 定期異常偵測結束；未偵測到人物，"
+                    "停止後續排程。"
+                )
+            periodic_person_seen = False
+
+        periodic_anomaly_active = (
+            periodic_anomaly_until is not None
+            and mode_now < periodic_anomaly_until
+        )
+
+        if has_movement:
+            if movement_detection_mode:
+                print("[mode] 偵測到移動，恢復持續異常偵測。")
+            movement_detection_mode = False
+            movement_mode_person_present = False
+            next_periodic_anomaly_at = None
+            periodic_anomaly_until = None
+            periodic_person_seen = False
+            anomaly_detection_active = True
+        elif startup_anomaly_active:
+            anomaly_detection_active = True
+        else:
+            if not movement_detection_mode:
+                movement_detection_mode = True
+                movement_mode_person_present = (
+                    last_person_seen_at is not None
+                    and mode_now - last_person_seen_at
+                    <= person_presence_memory_sec
+                )
+
+                if movement_mode_person_present:
+                    next_periodic_anomaly_at = (
+                        mode_now + movement_anomaly_interval_sec
+                    )
+                    print(
+                        "[mode] 進入 Movement Detection，"
+                        "最近畫面仍有人物；"
+                        f"{movement_anomaly_interval_sec / 60:.1f} 分鐘後"
+                        "啟動定期異常偵測。"
+                    )
+                else:
+                    next_periodic_anomaly_at = None
+                    print(
+                        "[mode] 進入 Movement Detection，"
+                        "最近畫面未偵測到人物。"
+                    )
+
+            if (
+                movement_mode_person_present
+                and next_periodic_anomaly_at is not None
+                and mode_now >= next_periodic_anomaly_at
+            ):
+                periodic_anomaly_until = (
+                    mode_now + movement_anomaly_duration_sec
+                )
+                next_periodic_anomaly_at = (
+                    mode_now + movement_anomaly_interval_sec
+                )
+                periodic_person_seen = False
+                periodic_anomaly_active = True
+                print(
+                    "[mode] 啟動定期異常偵測，持續 "
+                    f"{movement_anomaly_duration_sec / 60:.1f} 分鐘。"
+                )
+
+            anomaly_detection_active = periodic_anomaly_active
+
+        if not anomaly_detection_active:
+
+            # ==========================================
+            # Movement Detection → 暫停異常偵測並解除舊狀態
+            # ==========================================
+            if detection_state != "normal":
+                print(
+                    f"✅ [{current_sec:6.2f} 秒] "
+                    f"進入 Movement Detection，"
+                    f"直接解除異常狀態 ({detection_state} → normal)"
+                )
+
+            detection_state = "normal"
+
+            # 清除異常狀態
+            anomaly_candidate_start = None
+            anomaly_event_start = None
+            consecutive_normal_count = 0
+
+            # 清除之前的異常投票
+            anomaly_vote_history.clear()
+            current_anomaly_ratio = 0.0
+
+            # 清除之前 CROSR 的結果
+            current_radar_res = None
+
+            # 很重要：
+            # 不要讓恢復移動後還吃到之前的異常骨架
+            skeleton_buffer.clear()
+
+            # ==========================================
+            # 原本顯示 NO MOVEMENT 的程式
+            # ==========================================
             if CONFIG.get("show_yolo_window", True):
+
                 display_frame = frame.copy()
+
+                if (
+                    movement_mode_person_present
+                    and next_periodic_anomaly_at is not None
+                ):
+                    remaining_sec = max(
+                        0.0,
+                        next_periodic_anomaly_at - mode_now,
+                    )
+                    mode_text = (
+                        "MOVEMENT DETECTION | PERSON | "
+                        f"NEXT {remaining_sec:.0f}s"
+                    )
+                else:
+                    mode_text = "MOVEMENT DETECTION | NO PERSON"
+
                 cv2.putText(
                     display_frame,
-                    f"NO MOVEMENT ({motion_ratio:.2%})",
+                    mode_text,
                     (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
+                    0.6,
                     (0, 255, 255),
                     2,
                     cv2.LINE_AA,
                 )
+
                 cv2.imshow(
                     "ST-CROSR Live Real-Time Radar Monitor",
                     display_frame,
                 )
+
                 cv2.imshow(
                     "MOG2 Foreground Mask",
                     fg_mask,
                 )
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    stopped_by_user = True
-                    break
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stopped_by_user = True
+                break
 
             frame_idx += 1
             continue
@@ -383,6 +719,7 @@ def play_and_live_inference(
             frame,
             verbose=False,
         )
+        frame_has_person = False
 
         if (
             len(results) > 0
@@ -394,6 +731,7 @@ def play_and_live_inference(
                 keypoints is not None
                 and len(keypoints) > 0
             ):
+                frame_has_person = True
                 person_kpts = (
                     keypoints[0]
                     .detach()
@@ -408,6 +746,11 @@ def play_and_live_inference(
                     one_frame_skeleton[1, :] = (
                         person_kpts[:17, 1]
                     )
+
+        if frame_has_person:
+            last_person_seen_at = mode_now
+            if periodic_anomaly_active:
+                periodic_person_seen = True
 
         skeleton_buffer.append(one_frame_skeleton)
 

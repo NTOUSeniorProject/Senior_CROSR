@@ -36,6 +36,11 @@ CONFIG = {
 
     "show_yolo_window": True,
 
+    # 異常偵測與移動偵測的切換條件
+    "startup_anomaly_detection_sec": 10.0,
+    "movement_anomaly_interval_sec": 300.0,
+    "movement_anomaly_duration_sec": 60.0,
+
     "enable_youtube_url": True,
     "youtube_format": "best[protocol^=m3u8][height<=720]/best[protocol^=m3u8]/best[height<=720]/best",
     "use_browser_cookies": False,
