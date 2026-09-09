@@ -24,7 +24,7 @@ OLLAMA_TARGETS = {
 }
 DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_MODEL = "blaifa/InternVL3_5:8B"
-OPENAI_BASE_URL = "http://192.168.50.51:8001/v1"
+OPENAI_BASE_URL = "http://26.184.142.137:9000/v1"
 OPENAI_MODEL = "OpenGVLab/InternVL3-78B-AWQ"
 OPENAI_API_KEY = "EMPTY"
 
@@ -45,7 +45,7 @@ def prompt_target_selection() -> str:
     print("請選擇測試目標：")
     print(f"  1：Ollama {OLLAMA_TARGETS['1']}")
     print(f"  2：Ollama {OLLAMA_TARGETS['2']}")
-    print(f"  3：OpenAI-compatible API {OPENAI_BASE_URL}")
+    print(f"  3：經 PC-lab 轉送至 78B：{OPENAI_BASE_URL}")
     return input("請輸入 1、2 或 3：").strip()
 
 
@@ -411,7 +411,7 @@ def build_parser() -> argparse.ArgumentParser:
         "target", nargs="?",
         help=(
             "Ollama 選擇：1=26.184.142.137、2=26.247.236.14、"
-            "3=192.168.50.51:8001 OpenAI-compatible API；"
+            "3=經 26.184.142.137:9000 轉送至 78B；"
             "也可直接輸入自訂 Ollama IP。省略時顯示選單"
         ),
     )
