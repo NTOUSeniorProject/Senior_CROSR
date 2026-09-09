@@ -11,7 +11,78 @@ from event_handler import start_event_collection, finish_event_collection
 from line_notifier import push_line_message
 from VLM_check import analyze_frames_with_ollama
 from movement_detection import MovementDetector
+from threading import Lock, Thread, Event
+from queue import Queue, Empty, Full
 
+class LatestFrameReader:
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.queue = Queue(maxsize=1)
+        self.stop_event = Event()
+
+        self.thread = Thread(
+            target=self._reader,
+            daemon=True
+        )
+
+        self.thread.start()
+
+    def _reader(self):
+
+        while not self.stop_event.is_set():
+
+            ret, frame = self.cap.read()
+
+            # 串流讀取失敗
+            if not ret or frame is None:
+
+                # 清掉 Queue 舊資料
+                if self.queue.full():
+                    try:
+                        self.queue.get_nowait()
+                    except Empty:
+                        pass
+
+                # 用 None 通知主程式：
+                # 串流真的斷了
+                try:
+                    self.queue.put_nowait(None)
+                except Full:
+                    pass
+
+                break
+
+            # 舊 frame 不要留
+            if self.queue.full():
+
+                try:
+                    self.queue.get_nowait()
+                except Empty:
+                    pass
+
+            # 永遠只放最新 frame
+            try:
+                self.queue.put_nowait(frame)
+            except Full:
+                pass
+
+    def read(self, timeout=2.0):
+
+        try:
+            frame = self.queue.get(timeout=timeout)
+
+        except Empty:
+            return False, None
+
+        # None 代表背景 Reader 已經斷線
+        if frame is None:
+            return False, None
+
+        return True, frame
+
+    def stop(self):
+        self.stop_event.set()
 
 class _PendingVLMEvents:
     """以執行緒安全方式追蹤已提交但尚未完成的 VLM 事件。"""
@@ -120,6 +191,12 @@ def play_and_live_inference(
         or total_frames <= 0
     )
 
+    live_reader = None
+
+    if is_live_like_source:
+        print("📡 使用最新影格模式，避免直播延遲累積")
+        live_reader = LatestFrameReader(cap)
+
     window_size = int(CONFIG.get("window_size", 60))
     stride = max(1, int(CONFIG.get("stride", 5)))
 
@@ -219,32 +296,77 @@ def play_and_live_inference(
     )
 
     while True:
-        ret, frame = cap.read()
+        # ret, frame = cap.read()
+        if live_reader is not None:
+
+            ret, frame = live_reader.read()
+
+        else:
+
+            ret, frame = cap.read()
 
         if not ret or frame is None:
-            if CONFIG.get("is_live_stream", is_live_like_source):
+
+            should_reconnect = (
+                is_live_like_source
+                or CONFIG.get("is_live_stream", False)
+            )
+
+            if should_reconnect:
+
                 print("⚠️ 直播串流暫時中斷，嘗試重新連線...")
 
-                cap.release()
+                # ==========================================
+                # 1. 先停止舊的 LatestFrameReader
+                # ==========================================
+                if live_reader is not None:
+                    live_reader.stop()
+                    live_reader = None
+
+                # ==========================================
+                # 2. 釋放舊的 VideoCapture
+                # ==========================================
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
                 reconnect_success = False
 
+                # ==========================================
+                # 3. 最多重新連線 5 次
+                # ==========================================
                 for attempt in range(1, 6):
+
                     print(f"🔄 第 {attempt}/5 次重新連線...")
 
                     try:
                         time.sleep(2)
 
-                        cap, resolved_source = open_video_capture(video_path)
+                        new_cap, new_resolved_source = open_video_capture(
+                            video_path
+                        )
 
-                        test_ret, test_frame = cap.read()
+                        # 先直接測一張
+                        test_ret, test_frame = new_cap.read()
 
                         if test_ret and test_frame is not None:
+
                             print("✅ RTSP 重新連線成功。")
-                            frame = test_frame
-                            ret = True
+
+                            # 換成新的 cap
+                            cap = new_cap
+                            resolved_source = new_resolved_source
+
+                            # ==================================
+                            # 很重要：
+                            # 新 cap 一定要建立新的 Reader
+                            # ==================================
+                            live_reader = LatestFrameReader(cap)
+
                             reconnect_success = True
 
+                            # 清掉舊串流留下來的辨識狀態
                             skeleton_buffer.clear()
                             anomaly_vote_history.clear()
                             pre_event_buffer.clear()
@@ -255,17 +377,52 @@ def play_and_live_inference(
                             consecutive_normal_count = 0
                             current_anomaly_ratio = 0.0
                             motion_hold_remaining = 0
+
+                            # 如果斷線時正在收集異常事件，
+                            # 不要把重連後的畫面接到舊事件後面
+                            collecting_event = False
+                            event_id = None
+                            event_start_sec = None
+                            event_collect_until_sec = None
+                            event_frames = []
+                            post_event_anomaly_flags = []
+
                             break
 
-                        cap.release()
+                        else:
+                            print(
+                                f"⚠️ 第 {attempt} 次已連上，"
+                                "但讀不到有效影格。"
+                            )
+
+                            new_cap.release()
 
                     except Exception as e:
-                        print(f"⚠️ 第 {attempt} 次重新連線失敗：{e}")
 
+                        print(
+                            f"⚠️ 第 {attempt} 次重新連線失敗：{e}"
+                        )
+
+                # ==========================================
+                # 4. 五次全部失敗
+                # ==========================================
                 if not reconnect_success:
-                    print("❌ RTSP 連續重新連線失敗，停止推論。")
+
+                    print(
+                        "❌ RTSP 連續重新連線失敗，停止推論。"
+                    )
+
                     break
+
+                # ==========================================
+                # 很重要
+                # 重新連線後直接回 while 最上面
+                # 讓新的 LatestFrameReader 提供最新影格
+                # ==========================================
+                continue
+
             else:
+
                 print("🏁 影片已播放完畢，結束推論。")
                 break
 
@@ -348,8 +505,42 @@ def play_and_live_inference(
 
         has_movement = raw_has_movement or motion_hold_remaining > 0
         if not has_movement:
+
+            # ==========================================
+            # No Movement → 直接解除異常狀態
+            # ==========================================
+            if detection_state != "normal":
+                print(
+                    f"✅ [{current_sec:6.2f} 秒] "
+                    f"偵測到 NO MOVEMENT，"
+                    f"直接解除異常狀態 ({detection_state} → normal)"
+                )
+
+            detection_state = "normal"
+
+            # 清除異常狀態
+            anomaly_candidate_start = None
+            anomaly_event_start = None
+            consecutive_normal_count = 0
+
+            # 清除之前的異常投票
+            anomaly_vote_history.clear()
+            current_anomaly_ratio = 0.0
+
+            # 清除之前 CROSR 的結果
+            current_radar_res = None
+
+            # 很重要：
+            # 不要讓恢復移動後還吃到之前的異常骨架
+            skeleton_buffer.clear()
+
+            # ==========================================
+            # 原本顯示 NO MOVEMENT 的程式
+            # ==========================================
             if CONFIG.get("show_yolo_window", True):
+
                 display_frame = frame.copy()
+
                 cv2.putText(
                     display_frame,
                     f"NO MOVEMENT ({motion_ratio:.2%})",
@@ -360,17 +551,20 @@ def play_and_live_inference(
                     2,
                     cv2.LINE_AA,
                 )
+
                 cv2.imshow(
                     "ST-CROSR Live Real-Time Radar Monitor",
                     display_frame,
                 )
+
                 cv2.imshow(
                     "MOG2 Foreground Mask",
                     fg_mask,
                 )
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    stopped_by_user = True
-                    break
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stopped_by_user = True
+                break
 
             frame_idx += 1
             continue
