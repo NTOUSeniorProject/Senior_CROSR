@@ -16,9 +16,34 @@ from urllib.parse import urlparse
 import requests
 
 
-DEFAULT_ADDRESS = "26.184.142.137"
+OLLAMA_TARGETS = {
+    "1": "26.184.142.137",
+    "2": "26.247.236.14",
+}
 DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_MODEL = "blaifa/InternVL3_5:8B"
+
+
+def select_targets(selection: str) -> list[str]:
+    """將 1／2／3 轉成要測試的 Ollama 主機清單，也接受自訂位址。"""
+    selection = selection.strip()
+    if selection == "1":
+        return [OLLAMA_TARGETS["1"]]
+    if selection == "2":
+        return [OLLAMA_TARGETS["2"]]
+    if selection == "3":
+        return [OLLAMA_TARGETS["1"], OLLAMA_TARGETS["2"]]
+    if selection:
+        return [selection]
+    raise ValueError("請輸入 1、2 或 3")
+
+
+def prompt_target_selection() -> str:
+    print("請選擇 Ollama 主機：")
+    print(f"  1：{OLLAMA_TARGETS['1']}")
+    print(f"  2：{OLLAMA_TARGETS['2']}")
+    print("  3：兩台都傳")
+    return input("請輸入 1、2 或 3：").strip()
 
 
 def extract_host(address: str) -> str:
@@ -255,8 +280,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="測試遠端 Ollama，並可選擇執行單張圖片 VLM 推論。"
     )
     parser.add_argument(
-        "address", nargs="?", default=DEFAULT_ADDRESS,
-        help=f"遠端 IP 或主機名稱（預設：{DEFAULT_ADDRESS}）",
+        "target", nargs="?",
+        help=(
+            "Ollama 選擇：1=26.184.142.137、2=26.247.236.14、"
+            "3=兩台都傳；也可直接輸入自訂 IP。省略時顯示選單"
+        ),
     )
     parser.add_argument(
         "--count", type=int, default=4,
@@ -308,16 +336,39 @@ def main() -> int:
         return 1
 
     try:
-        return test_connection(
-            args.address,
-            args.count,
-            args.timeout,
-            args.port,
-            args.ollama_timeout,
-            args.image,
-            args.model,
-            args.inference_timeout,
-        )
+        selection = args.target if args.target is not None else prompt_target_selection()
+        targets = select_targets(selection)
+
+        results = []
+        for index, address in enumerate(targets, start=1):
+            if len(targets) > 1:
+                print(f"\n{'=' * 60}")
+                print(f"測試第 {index}/{len(targets)} 台 Ollama：{address}")
+                print(f"{'=' * 60}")
+
+            result = test_connection(
+                address,
+                args.count,
+                args.timeout,
+                args.port,
+                args.ollama_timeout,
+                args.image,
+                args.model,
+                args.inference_timeout,
+            )
+            results.append((address, result))
+
+        if len(results) > 1:
+            print("\n兩台 Ollama 測試結果：")
+            for address, result in results:
+                status = "成功" if result == 0 else "失敗"
+                print(f"  {address}：{status}")
+
+        return 0 if all(result == 0 for _, result in results) else 1
+
+    except (EOFError, KeyboardInterrupt):
+        print("\n[取消] 未選擇 Ollama 主機。", file=sys.stderr)
+        return 1
     except ValueError as error:
         print(f"[失敗] {error}", file=sys.stderr)
         return 1
