@@ -1,10 +1,12 @@
-"""測試本機是否能連線到遠端電腦及其 Ollama 服務。
+"""測試兩台 Ollama 或 OpenAI-compatible VLM API。
 
+選項 1、2 使用 Ollama API；選項 3 使用 OpenAI Python SDK。
 未指定圖片時只檢查連線；使用 --image 時會執行一次單張圖片推論。
 """
 
 import argparse
 import base64
+import mimetypes
 import platform
 import socket
 import subprocess
@@ -16,9 +18,160 @@ from urllib.parse import urlparse
 import requests
 
 
-DEFAULT_ADDRESS = "26.184.142.137"
+OLLAMA_TARGETS = {
+    "1": "26.184.142.137",
+    "2": "26.247.236.14",
+}
 DEFAULT_OLLAMA_PORT = 11434
 DEFAULT_MODEL = "blaifa/InternVL3_5:8B"
+OPENAI_BASE_URL = "http://26.184.142.137:9000/v1"
+OPENAI_MODEL = "OpenGVLab/InternVL3-78B-AWQ"
+OPENAI_API_KEY = "EMPTY"
+
+
+def select_targets(selection: str) -> list[str]:
+    """將 1／2 轉成要測試的 Ollama 主機，也接受自訂位址。"""
+    selection = selection.strip()
+    if selection == "1":
+        return [OLLAMA_TARGETS["1"]]
+    if selection == "2":
+        return [OLLAMA_TARGETS["2"]]
+    if selection:
+        return [selection]
+    raise ValueError("請輸入 1、2、3 或自訂位址")
+
+
+def prompt_target_selection() -> str:
+    print("請選擇測試目標：")
+    print(f"  1：Ollama {OLLAMA_TARGETS['1']}")
+    print(f"  2：Ollama {OLLAMA_TARGETS['2']}")
+    print(f"  3：經 PC-lab 轉送至 78B：{OPENAI_BASE_URL}")
+    return input("請輸入 1、2 或 3：").strip()
+
+
+def image_to_data_url(image_path: str) -> str:
+    """將本機圖片轉成 Chat Completions 使用的 data URL。"""
+    path = Path(image_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到測試圖片：{path}")
+
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def test_openai_compatible(
+    image_path: str | None,
+    timeout: float,
+) -> int:
+    """使用 OpenAI Python SDK 測試模型主機及選用的圖片推論。"""
+    try:
+        from openai import (
+            APIConnectionError,
+            APIStatusError,
+            APITimeoutError,
+            OpenAI,
+        )
+    except ImportError:
+        print(
+            "[失敗] 選項 3 需要 OpenAI Python SDK，請先執行："
+            "pip install openai",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"目標 API：{OPENAI_BASE_URL}")
+    print(f"指定模型：{OPENAI_MODEL}")
+    client = OpenAI(
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY,
+        timeout=timeout,
+        max_retries=0,
+    )
+
+    try:
+        print("[1/2] 呼叫 /v1/models，測試 OpenAI-compatible API...")
+        response = client.models.list()
+        model_ids = [item.id for item in response.data]
+        print("  API 連線成功。")
+
+        if model_ids:
+            print("  主機提供的模型：")
+            for model_id in model_ids:
+                print(f"    - {model_id}")
+
+        if model_ids and OPENAI_MODEL not in model_ids:
+            print(
+                f"[失敗] 模型清單中找不到：{OPENAI_MODEL}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if image_path is None:
+            print("\n[成功] OpenAI-compatible API 連線正常；未執行圖片推論。")
+            return 0
+
+        print(f"[2/2] 執行單張圖片 VLM 推論：{image_path}")
+        started_at = time.perf_counter()
+        completion = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "請用繁體中文簡短描述圖片中的人物、"
+                                "動作與環境；若沒有看見人物，請明確說明。"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_to_data_url(image_path),
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0.1,
+            max_tokens=200,
+        )
+        elapsed = time.perf_counter() - started_at
+        content = (
+            completion.choices[0].message.content
+            if completion.choices
+            else None
+        )
+        if not content:
+            print("[失敗] 模型沒有回傳文字內容。", file=sys.stderr)
+            return 1
+
+        print(f"  推論時間：{elapsed:.2f} 秒")
+        print(f"  VLM 回覆：{content.strip()}")
+        print("\n[成功] OpenAI-compatible 單張圖片推論完成。")
+        return 0
+
+    except APIConnectionError as error:
+        print(
+            f"[失敗] 無法連線到 {OPENAI_BASE_URL}：{error}",
+            file=sys.stderr,
+        )
+    except APITimeoutError:
+        print(f"[失敗] API 請求超過 {timeout} 秒。", file=sys.stderr)
+    except APIStatusError as error:
+        detail = getattr(error.response, "text", str(error))
+        print(
+            f"[失敗] API 回傳 HTTP {error.status_code}：{detail[:1000]}",
+            file=sys.stderr,
+        )
+    except FileNotFoundError as error:
+        print(f"[失敗] {error}", file=sys.stderr)
+    except (IndexError, ValueError) as error:
+        print(f"[失敗] API 回應格式錯誤：{error}", file=sys.stderr)
+
+    return 1
 
 
 def extract_host(address: str) -> str:
@@ -252,11 +405,15 @@ def test_connection(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="測試遠端 Ollama，並可選擇執行單張圖片 VLM 推論。"
+        description="測試遠端 Ollama 或 OpenAI-compatible VLM API。"
     )
     parser.add_argument(
-        "address", nargs="?", default=DEFAULT_ADDRESS,
-        help=f"遠端 IP 或主機名稱（預設：{DEFAULT_ADDRESS}）",
+        "target", nargs="?",
+        help=(
+            "Ollama 選擇：1=26.184.142.137、2=26.247.236.14、"
+            "3=經 26.184.142.137:9000 轉送至 78B；"
+            "也可直接輸入自訂 Ollama IP。省略時顯示選單"
+        ),
     )
     parser.add_argument(
         "--count", type=int, default=4,
@@ -308,16 +465,47 @@ def main() -> int:
         return 1
 
     try:
-        return test_connection(
-            args.address,
-            args.count,
-            args.timeout,
-            args.port,
-            args.ollama_timeout,
-            args.image,
-            args.model,
-            args.inference_timeout,
-        )
+        selection = args.target if args.target is not None else prompt_target_selection()
+        selection = selection.strip()
+
+        if selection == "3":
+            return test_openai_compatible(
+                image_path=args.image,
+                timeout=args.inference_timeout,
+            )
+
+        targets = select_targets(selection)
+
+        results = []
+        for index, address in enumerate(targets, start=1):
+            if len(targets) > 1:
+                print(f"\n{'=' * 60}")
+                print(f"測試第 {index}/{len(targets)} 台 Ollama：{address}")
+                print(f"{'=' * 60}")
+
+            result = test_connection(
+                address,
+                args.count,
+                args.timeout,
+                args.port,
+                args.ollama_timeout,
+                args.image,
+                args.model,
+                args.inference_timeout,
+            )
+            results.append((address, result))
+
+        if len(results) > 1:
+            print("\n兩台 Ollama 測試結果：")
+            for address, result in results:
+                status = "成功" if result == 0 else "失敗"
+                print(f"  {address}：{status}")
+
+        return 0 if all(result == 0 for _, result in results) else 1
+
+    except (EOFError, KeyboardInterrupt):
+        print("\n[取消] 未選擇 Ollama 主機。", file=sys.stderr)
+        return 1
     except ValueError as error:
         print(f"[失敗] {error}", file=sys.stderr)
         return 1
