@@ -126,10 +126,10 @@ def _analyze_event_with_vlm(frame_paths, line_user_id, pending_events):
 
     alert_text = (
         "🚨 VLM 確認異常事件\n"
-        f"類型：{vlm_result['category']}\n"
-        f"信心度：{vlm_result['confidence']:.0%}\n"
+        # f"類型：{vlm_result['category']}\n"
+        # f"信心度：{vlm_result['confidence']:.0%}\n"
         f"描述：{vlm_result['description']}\n"
-        f"剩餘待處理事件：{pending_events.waiting_after_current()}"
+        # f"剩餘待處理事件：{pending_events.waiting_after_current()}"
     )
     push_line_message(line_user_id, alert_text)
 
@@ -222,6 +222,19 @@ def play_and_live_inference(
         CONFIG.get("alert_cooldown_sec", 30.0)
     )
 
+    startup_anomaly_detection_sec = max(
+        0.0,
+        float(CONFIG.get("startup_anomaly_detection_sec", 10.0)),
+    )
+    movement_anomaly_interval_sec = max(
+        0.1,
+        float(CONFIG.get("movement_anomaly_interval_sec", 300.0)),
+    )
+    movement_anomaly_duration_sec = max(
+        0.1,
+        float(CONFIG.get("movement_anomaly_duration_sec", 60.0)),
+    )
+
     evaluation_interval_sec = stride / fps
     vote_history_size = max(
         min_anomaly_votes,
@@ -257,6 +270,15 @@ def play_and_live_inference(
     print(f"候選異常維持: {consecutive_alert_sec:.1f} 秒")
     print(f"解除條件: 連續 {clear_normal_windows} 個正常視窗")
     print(f"通知冷卻: {alert_cooldown_sec:.1f} 秒")
+    print(
+        f"啟動時強制異常偵測: "
+        f"{startup_anomaly_detection_sec:.1f} 秒"
+    )
+    print(
+        "Movement Detection 中仍有人物時: "
+        f"每 {movement_anomaly_interval_sec / 60:.1f} 分鐘"
+        f"啟動 {movement_anomaly_duration_sec / 60:.1f} 分鐘異常偵測"
+    )
     print("============================================================\n")
 
     skeleton_buffer = []
@@ -275,6 +297,21 @@ def play_and_live_inference(
 
     motion_grace_frames = max(1, int(fps * 2.0))
     motion_hold_remaining = 0
+
+    mode_started_at = time.monotonic()
+    startup_anomaly_until = (
+        mode_started_at + startup_anomaly_detection_sec
+    )
+    person_presence_memory_sec = max(
+        3.0,
+        motion_grace_frames / fps + 1.0,
+    )
+    last_person_seen_at = None
+    movement_detection_mode = False
+    movement_mode_person_present = False
+    next_periodic_anomaly_at = None
+    periodic_anomaly_until = None
+    periodic_person_seen = False
 
     detection_state = "normal"
     anomaly_candidate_start = None
@@ -377,7 +414,12 @@ def play_and_live_inference(
                             consecutive_normal_count = 0
                             current_anomaly_ratio = 0.0
                             motion_hold_remaining = 0
-
+                            last_person_seen_at = None
+                            movement_detection_mode = False
+                            movement_mode_person_present = False
+                            next_periodic_anomaly_at = None
+                            periodic_anomaly_until = None
+                            periodic_person_seen = False
                             # 如果斷線時正在收集異常事件，
                             # 不要把重連後的畫面接到舊事件後面
                             collecting_event = False
@@ -504,15 +546,99 @@ def play_and_live_inference(
             motion_hold_remaining -= 1
 
         has_movement = raw_has_movement or motion_hold_remaining > 0
-        if not has_movement:
+        mode_now = time.monotonic()
+        startup_anomaly_active = mode_now < startup_anomaly_until
+
+        if (
+            periodic_anomaly_until is not None
+            and mode_now >= periodic_anomaly_until
+        ):
+            periodic_anomaly_until = None
+            if periodic_person_seen:
+                print(
+                    "[mode] 定期異常偵測結束；畫面仍有人物，"
+                    "保留下一次排程。"
+                )
+            else:
+                movement_mode_person_present = False
+                next_periodic_anomaly_at = None
+                print(
+                    "[mode] 定期異常偵測結束；未偵測到人物，"
+                    "停止後續排程。"
+                )
+            periodic_person_seen = False
+
+        periodic_anomaly_active = (
+            periodic_anomaly_until is not None
+            and mode_now < periodic_anomaly_until
+        )
+
+        if has_movement:
+            if movement_detection_mode:
+                print("[mode] 偵測到移動，恢復持續異常偵測。")
+            movement_detection_mode = False
+            movement_mode_person_present = False
+            next_periodic_anomaly_at = None
+            periodic_anomaly_until = None
+            periodic_person_seen = False
+            anomaly_detection_active = True
+        elif startup_anomaly_active:
+            anomaly_detection_active = True
+        else:
+            if not movement_detection_mode:
+                movement_detection_mode = True
+                movement_mode_person_present = (
+                    last_person_seen_at is not None
+                    and mode_now - last_person_seen_at
+                    <= person_presence_memory_sec
+                )
+
+                if movement_mode_person_present:
+                    next_periodic_anomaly_at = (
+                        mode_now + movement_anomaly_interval_sec
+                    )
+                    print(
+                        "[mode] 進入 Movement Detection，"
+                        "最近畫面仍有人物；"
+                        f"{movement_anomaly_interval_sec / 60:.1f} 分鐘後"
+                        "啟動定期異常偵測。"
+                    )
+                else:
+                    next_periodic_anomaly_at = None
+                    print(
+                        "[mode] 進入 Movement Detection，"
+                        "最近畫面未偵測到人物。"
+                    )
+
+            if (
+                movement_mode_person_present
+                and next_periodic_anomaly_at is not None
+                and mode_now >= next_periodic_anomaly_at
+            ):
+                periodic_anomaly_until = (
+                    mode_now + movement_anomaly_duration_sec
+                )
+                next_periodic_anomaly_at = (
+                    mode_now + movement_anomaly_interval_sec
+                )
+                periodic_person_seen = False
+                periodic_anomaly_active = True
+                print(
+                    "[mode] 啟動定期異常偵測，持續 "
+                    f"{movement_anomaly_duration_sec / 60:.1f} 分鐘。"
+                )
+
+            anomaly_detection_active = periodic_anomaly_active
+
+        if not anomaly_detection_active:
 
             # ==========================================
-            # No Movement → 直接解除異常狀態
+            # Movement Detection → 暫停異常偵測並解除舊狀態
             # ==========================================
             if detection_state != "normal":
                 print(
                     f"✅ [{current_sec:6.2f} 秒] "
-                    f"偵測到 NO MOVEMENT，"
+                    f"進入 Movement Detection，"
                     f"直接解除異常狀態 ({detection_state} → normal)"
                 )
 
@@ -541,13 +667,40 @@ def play_and_live_inference(
 
                 display_frame = frame.copy()
 
+                if (
+                    movement_mode_person_present
+                    and next_periodic_anomaly_at is not None
+                ):
+                    remaining_sec = max(
+                        0.0,
+                        next_periodic_anomaly_at - mode_now,
+                    )
+                    mode_text = (
+                        "MOVEMENT DETECTION | PERSON | "
+                        f"NEXT {remaining_sec:.0f}s"
+                    )
+                else:
+                    mode_text = "MOVEMENT DETECTION | NO PERSON"
+
                 cv2.putText(
                     display_frame,
-                    f"NO MOVEMENT ({motion_ratio:.2%})",
+                    mode_text,
                     (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
+                    0.6,
                     (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                # 顯示 MOG2 畫面變化比例
+                cv2.putText(
+                    display_frame,
+                    f"Difference: {motion_ratio * 100:.2f}%",
+                    (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
                     2,
                     cv2.LINE_AA,
                 )
@@ -577,6 +730,7 @@ def play_and_live_inference(
             frame,
             verbose=False,
         )
+        frame_has_person = False
 
         if (
             len(results) > 0
@@ -588,6 +742,7 @@ def play_and_live_inference(
                 keypoints is not None
                 and len(keypoints) > 0
             ):
+                frame_has_person = True
                 person_kpts = (
                     keypoints[0]
                     .detach()
@@ -602,6 +757,11 @@ def play_and_live_inference(
                     one_frame_skeleton[1, :] = (
                         person_kpts[:17, 1]
                     )
+
+        if frame_has_person:
+            last_person_seen_at = mode_now
+            if periodic_anomaly_active:
+                periodic_person_seen = True
 
         skeleton_buffer.append(one_frame_skeleton)
 
@@ -910,13 +1070,13 @@ def play_and_live_inference(
                     f"{total_frames / fps:.2f}s"
                 )
 
-            cv2.rectangle(
-                display_frame,
-                (10, 10),
-                (620, 120),
-                (0, 0, 0),
-                -1
-            )
+            # cv2.rectangle(
+            #     display_frame,
+            #     (10, 10),
+            #     (620, 120),
+            #     (0, 0, 0),
+            #     -1
+            # )
 
             cv2.putText(
                 display_frame,
@@ -988,6 +1148,17 @@ def play_and_live_inference(
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.52,
                     status_color,
+                    2,
+                    cv2.LINE_AA
+                )
+
+                cv2.putText(
+                    display_frame,
+                    f"Motion Ratio: {motion_ratio * 100:.2f}%",
+                    (20, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 0),
                     2,
                     cv2.LINE_AA
                 )
