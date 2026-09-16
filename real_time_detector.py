@@ -126,10 +126,10 @@ def _analyze_event_with_vlm(frame_paths, line_user_id, pending_events):
 
     alert_text = (
         "🚨 VLM 確認異常事件\n"
-        f"類型：{vlm_result['category']}\n"
-        f"信心度：{vlm_result['confidence']:.0%}\n"
+        # f"類型：{vlm_result['category']}\n"
+        # f"信心度：{vlm_result['confidence']:.0%}\n"
         f"描述：{vlm_result['description']}\n"
-        f"剩餘待處理事件：{pending_events.waiting_after_current()}"
+        # f"剩餘待處理事件：{pending_events.waiting_after_current()}"
     )
     push_line_message(line_user_id, alert_text)
 
@@ -694,6 +694,18 @@ def play_and_live_inference(
                     cv2.LINE_AA,
                 )
 
+                # 顯示 MOG2 畫面變化比例
+                cv2.putText(
+                    display_frame,
+                    f"Difference: {motion_ratio * 100:.2f}%",
+                    (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
                 cv2.imshow(
                     "ST-CROSR Live Real-Time Radar Monitor",
                     display_frame,
@@ -1059,13 +1071,13 @@ def play_and_live_inference(
                     f"{total_frames / fps:.2f}s"
                 )
 
-            cv2.rectangle(
-                display_frame,
-                (10, 10),
-                (620, 120),
-                (0, 0, 0),
-                -1
-            )
+            # cv2.rectangle(
+            #     display_frame,
+            #     (10, 10),
+            #     (620, 120),
+            #     (0, 0, 0),
+            #     -1
+            # )
 
             cv2.putText(
                 display_frame,
@@ -1137,6 +1149,17 @@ def play_and_live_inference(
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.52,
                     status_color,
+                    2,
+                    cv2.LINE_AA
+                )
+
+                cv2.putText(
+                    display_frame,
+                    f"Motion Ratio: {motion_ratio * 100:.2f}%",
+                    (20, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 0),
                     2,
                     cv2.LINE_AA
                 )

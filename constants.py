@@ -38,7 +38,7 @@ CONFIG = {
 
     # 異常偵測與移動偵測的切換條件
     "startup_anomaly_detection_sec": 10.0,
-    "movement_anomaly_interval_sec": 300.0,
+    "movement_anomaly_interval_sec": 90.0,
     "movement_anomaly_duration_sec": 60.0,
 
     "enable_youtube_url": True,
