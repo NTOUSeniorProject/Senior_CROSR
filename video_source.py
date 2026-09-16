@@ -135,6 +135,16 @@ def resolve_youtube_stream_url(youtube_url):
         )
 
 
+def normalize_video_source(source):
+    """移除貼上路徑時帶入的成對外層引號，保留檔名內的引號與空白。"""
+    source = "" if source is None else str(source).strip()
+    while len(source) >= 2 and source[0] in ("'", '"') and source[-1] == source[0]:
+        source = source[1:-1].strip()
+    if not source:
+        raise ValueError("CONFIG['video_path'] 是空的，請填入本機影片路徑或 YouTube 連結。")
+    return source
+
+
 def resolve_video_source(source):
     """
     將輸入來源統一轉成 OpenCV 可以讀的來源。
@@ -144,10 +154,7 @@ def resolve_video_source(source):
     3. m3u8 / rtsp / rtmp / http 影片串流
     """
 
-    if source is None or str(source).strip() == "":
-        raise ValueError("CONFIG['video_path'] 是空的，請填入本機影片路徑或 YouTube 連結。")
-
-    source = str(source).strip()
+    source = normalize_video_source(source)
 
     # 1. 本機檔案存在
     if os.path.exists(source):

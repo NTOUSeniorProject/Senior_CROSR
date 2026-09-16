@@ -1,10 +1,25 @@
 import base64
 import json
 import mimetypes
+import os
 from pathlib import Path
 from typing import Any
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
+
+# 實驗時可設環境變數 VLM_EXPERIMENT_MODE=1，或直接改為 True。
+EXPERIMENT_MODE = os.getenv("VLM_EXPERIMENT_MODE", "0") == "1"
+
+
+def _post_vlm(*args: Any, **kwargs: Any):
+    layer = kwargs.pop("experiment_layer", None)
+    if EXPERIMENT_MODE:
+        from systemVsVLM import request_vlm
+        return request_vlm(*args, experiment_layer=layer, **kwargs)
+    return requests.post(*args, **kwargs)
 
 
 
@@ -177,8 +192,9 @@ def _request_ollama(
 ) -> dict[str, Any]:
     """送出一次 Ollama VLM 請求，並整理成系統使用的結果格式。"""
     try:
-        response = requests.post(
+        response = _post_vlm(
             url,
+            experiment_layer=vlm_group,
             json=payload,
             timeout=timeout,
         )
@@ -224,8 +240,9 @@ def _request_openai_compatible(
 ) -> dict[str, Any]:
     """經 PC-lab relay 呼叫 OpenAI-compatible 78B VLM。"""
     try:
-        response = requests.post(
+        response = _post_vlm(
             VLM_78B_CHAT_URL,
+            experiment_layer=vlm_group,
             headers={
                 "Authorization": f"Bearer {VLM_78B_API_KEY}",
                 "Content-Type": "application/json",

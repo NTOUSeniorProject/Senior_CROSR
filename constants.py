@@ -7,7 +7,7 @@ load_dotenv()
 # 配置區
 # ============================================================
 CONFIG = {
-    "video_path": r"https://youtu.be/kD0RBvXA1q4?si=ZJnV3lV45Yifloay",
+    "video_path": os.getenv("VIDEO_PATH", r"https://youtu.be/kD0RBvXA1q4?si=ZJnV3lV45Yifloay"),
     "yolo_model_path": r"yolo26x-pose.pt",
     "checkpoint_path": r"checkpoints_20260602_2237\best_val.pth",
     "radar_meta_path": r"radar_meta_params.pth",
