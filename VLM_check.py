@@ -7,6 +7,7 @@ from typing import Any
 import requests
 
 
+
 # ===== VLM 連線設定（直接在此處修改，不從 .env 讀取）=====
 OLLAMA_BASE_URL = "http://26.184.142.137:11434"
 OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"

@@ -420,7 +420,6 @@ def play_and_live_inference(
                             next_periodic_anomaly_at = None
                             periodic_anomaly_until = None
                             periodic_person_seen = False
-
                             # 如果斷線時正在收集異常事件，
                             # 不要把重連後的畫面接到舊事件後面
                             collecting_event = False
