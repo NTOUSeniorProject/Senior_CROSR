@@ -1,12 +1,9 @@
 import sys
-import os
 import torch
 from ultralytics import YOLO
 from constants import CONFIG
 from model_loader import load_radar_meta_params, load_st_crosr_model
 from real_time_detector import play_and_live_inference
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Functions"))
 
 
 def main(video_path=None, line_user_id=None):

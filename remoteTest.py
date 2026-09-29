@@ -5,28 +5,28 @@
 """
 
 import argparse
-import base64
-import mimetypes
 import platform
 import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from image_encoding import image_to_base64, image_to_data_url
 
+
+from constants import (
+    project_path, OLLAMA_BASE_URL, OLLAMA_MODEL as DEFAULT_MODEL,
+    VLM_78B_BASE_URL as OPENAI_BASE_URL, VLM_78B_MODEL as OPENAI_MODEL,
+    VLM_78B_API_KEY as OPENAI_API_KEY,
+)
 
 OLLAMA_TARGETS = {
-    "1": "26.184.142.137",
+    "1": urlparse(OLLAMA_BASE_URL).hostname,
     "2": "26.247.236.14",
 }
-DEFAULT_OLLAMA_PORT = 11434
-DEFAULT_MODEL = "blaifa/InternVL3_5:8B"
-OPENAI_BASE_URL = "http://26.184.142.137:9000/v1"
-OPENAI_MODEL = "OpenGVLab/InternVL3-78B-AWQ"
-OPENAI_API_KEY = "EMPTY"
+DEFAULT_OLLAMA_PORT = urlparse(OLLAMA_BASE_URL).port or 11434
 
 
 def select_targets(selection: str) -> list[str]:
@@ -47,17 +47,6 @@ def prompt_target_selection() -> str:
     print(f"  2：Ollama {OLLAMA_TARGETS['2']}")
     print(f"  3：經 PC-lab 轉送至 78B：{OPENAI_BASE_URL}")
     return input("請輸入 1、2 或 3：").strip()
-
-
-def image_to_data_url(image_path: str) -> str:
-    """將本機圖片轉成 Chat Completions 使用的 data URL。"""
-    path = Path(image_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"找不到測試圖片：{path}")
-
-    mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
 
 
 def test_openai_compatible(
@@ -207,13 +196,13 @@ def test_image_inference(
     model: str,
     timeout: float,
 ) -> int:
-    path = Path(image_path)
+    path = project_path(image_path)
     if not path.is_file():
         print(f"[失敗] 找不到測試圖片：{path}", file=sys.stderr)
         return 1
 
     print(f"[4/4] 執行單張圖片 VLM 推論：{path}")
-    encoded_image = base64.b64encode(path.read_bytes()).decode("ascii")
+    encoded_image = image_to_base64(path)
     payload = {
         "model": model,
         "stream": False,

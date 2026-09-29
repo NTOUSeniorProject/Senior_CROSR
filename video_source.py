@@ -4,7 +4,7 @@ import sys
 import cv2
 import shutil
 import subprocess
-from constants import CONFIG
+from constants import CONFIG, project_path
 
 
 def is_url(source):
@@ -148,6 +148,12 @@ def resolve_video_source(source):
         raise ValueError("CONFIG['video_path'] 是空的，請填入本機影片路徑或 YouTube 連結。")
 
     source = str(source).strip()
+    while len(source) >= 2 and source[0] in ("'", '"') and source[-1] == source[0]:
+        source = source[1:-1].strip()
+    if not source:
+        raise ValueError("影片來源不可為空")
+    if not is_url(source):
+        source = str(project_path(source))
 
     # 1. 本機檔案存在
     if os.path.exists(source):

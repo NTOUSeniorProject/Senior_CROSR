@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 假設這些元件已經存放在你的專案中 (參考前幾篇的官方程式碼)
-from net.net import Unit2D
-from net.unit_gcn import unit_gcn
-from net.st_gcn import TCN_GCN_unit 
+# 使用套件內相對匯入，不依賴入口程式修改 sys.path。
+from .net.net import Unit2D
+from .net.unit_gcn import unit_gcn
+from .net.st_gcn import TCN_GCN_unit
 
 class STGCN_Encoder(nn.Module):
     def __init__(self, in_channels=2, latent_dim=256, A=None): 

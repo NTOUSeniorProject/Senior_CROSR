@@ -1,31 +1,23 @@
-import base64
+from image_encoding import image_to_base64, image_to_data_url as _image_data_url
 import json
-import mimetypes
-from pathlib import Path
 from typing import Any
 
 import requests
 
 
 
-# ===== VLM 連線設定（直接在此處修改，不從 .env 讀取）=====
-OLLAMA_BASE_URL = "http://26.184.142.137:11434"
-OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
-OLLAMA_MODEL = "blaifa/InternVL3_5:8B"
+from constants import (
+    OLLAMA_BASE_URL,
+    OLLAMA_URL,
+    OLLAMA_MODEL,
+    VLM_78B_BASE_URL,
+    VLM_78B_CHAT_URL,
+    VLM_78B_MODEL,
+    VLM_78B_API_KEY,
+    DOUBLE_VLM,
+    VLM_78B_LAYER,
+)
 
-# 本機 -> PC-lab relay -> 78B 大型主機
-VLM_78B_BASE_URL = "http://26.184.142.137:9000/v1"
-VLM_78B_CHAT_URL = f"{VLM_78B_BASE_URL}/chat/completions"
-VLM_78B_MODEL = "OpenGVLab/InternVL3-78B-AWQ"
-VLM_78B_API_KEY = "EMPTY"
-
-# 0：只使用第一組 VLM
-# 1：第一組判定無異常時，再將相同資料送至第二組 VLM
-DOUBLE_VLM = 1
-
-# 1：78B 放在第一層，Ollama 4B 放在第二層
-# 2：Ollama 4B 放在第一層，78B 放在第二層
-VLM_78B_LAYER = 2
 
 ABNORMAL_RESULT_SCHEMA = {
     "type": "object",
@@ -105,21 +97,6 @@ VLM_PROMPT = """
   "need_alert": true 或 false
 }
 """
-
-
-def image_to_base64(image_path: str) -> str:
-    path = Path(image_path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"找不到圖片：{image_path}")
-
-    with path.open("rb") as file:
-        return base64.b64encode(file.read()).decode("utf-8")
-
-
-def _image_data_url(image_path: str, encoded_image: str) -> str:
-    mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
-    return f"data:{mime_type};base64,{encoded_image}"
 
 
 def _parse_result_json(raw_content: str, source_name: str) -> dict[str, Any]:

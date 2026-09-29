@@ -1,9 +1,6 @@
 import os
-import sys
 import torch
 from constants import CONFIG, KNOWN_ACTIONS, DEFAULT_KNOWN_ACTIONS
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Functions"))
 
 from Functions.ST_CROSR import ST_CROSR
 
@@ -30,7 +27,7 @@ def load_radar_meta_params(device):
     mse_weight = float(meta.get("mse_weight", 0.6))
 
     if "known_actions" in meta:
-        KNOWN_ACTIONS = list(map(int, meta["known_actions"]))
+        KNOWN_ACTIONS[:] = list(map(int, meta["known_actions"]))
 
     print("✅ 已成功加載雷達校正邊界與全域閾值")
     return centroids_norm, normalizer, threshold, dist_weight, mse_weight

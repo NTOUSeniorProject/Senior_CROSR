@@ -1,3 +1,4 @@
+from constants import CONFIG, KNOWN_ACTIONS, ACTION_NAMES
 import os
 import cv2
 import torch
@@ -15,68 +16,10 @@ from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 # ============================================================
 # 設定區
 # ============================================================
-CONFIG = {
-    # "video_path": r"C:\CROSR\Videos\01打針.mp4",
-    # "video_path": r"C:\CROSR\downloads\摔倒参考.mp4",
-    "video_path": r"C:\CROSR\IMG_2033.mov",
-    "yolo_model_path": r"C:\CROSR\yolo26x-pose.pt",
-    "checkpoint_path": r"checkpoints_20260602_2237\best_val.pth",
-    "radar_meta_path": r"C:\CROSR\radar_meta_params.pth",
-
-    "max_frames": 300,
-    "num_nodes": 17,
-    "center_joint_idx": 11,
-
-    "window_size": 120,
-    "stride": 30,
-
-    # ── 閾值設定 ──────────────────────────────────────────────
-    # True  → 使用 radar_meta_params.pth 裡面儲存的閾值
-    # False → 使用下方 manual_threshold
-    "use_saved_threshold": False,
-    "manual_threshold": 0.4,
-
-    # ── 連續異常報警設定 ──────────────────────────────────────
-    # True  → 需連續偵測異常達 consecutive_alert_sec 秒才觸發警報
-    # False → 單次超過閾值就立即報警（舊行為）
-    "use_consecutive_alert": True,
-    "consecutive_alert_sec": 4,       # 需連續異常幾秒才報警
-
-    # 報警後冷卻時間（秒），冷卻期間不重複警報
-    "alert_cooldown_sec": 4,
-
-    "show_yolo_window": True,
-}
 
 
-DEFAULT_KNOWN_ACTIONS = [
-    1, 2, 3, 4, 5, 6,
-    8, 9, 11, 12,
-    14, 15, 16, 17, 18, 19, 20, 21,
-    23, 25,
-    28, 29, 30, 32, 33, 34, 37,
-    41, 44, 45, 46, 47, 49
-]
 
-KNOWN_ACTIONS = DEFAULT_KNOWN_ACTIONS.copy()
 
-ACTION_NAMES = {
-    1: "drink water", 2: "eat meal/snack", 3: "brushing teeth", 4: "brushing hair",
-    5: "drop", 6: "pickup", 7: "throw", 8: "sitting down", 9: "standing up",
-    10: "clapping", 11: "reading", 12: "writing", 13: "tear up paper",
-    14: "wear jacket", 15: "take off jacket", 16: "wear shoe", 17: "take off shoe",
-    18: "wear glasses", 19: "take off glasses", 20: "put on hat/cap", 21: "take off hat/cap",
-    22: "cheer up", 23: "hand waving", 24: "kicking something", 25: "reach into pocket",
-    26: "hopping", 27: "jump up", 28: "make a phone call", 29: "playing with phone/tablet",
-    30: "typing on keyboard", 31: "pointing to something", 32: "taking a selfie",
-    33: "check time", 34: "rub two hands", 35: "nod head/bow", 36: "shake head",
-    37: "wipe face", 38: "salute", 39: "put palms together", 40: "cross hands in front",
-    41: "sneeze/cough", 42: "staggering", 43: "falling", 44: "touch head",
-    45: "touch chest", 46: "touch back", 47: "touch neck", 48: "nausea/vomiting",
-    49: "use a fan", 50: "punching/slapping", 51: "kicking", 52: "pushing",
-    53: "pat on back", 54: "point finger", 55: "hugging", 56: "giving object",
-    57: "touch pocket", 58: "shaking hands", 59: "walking towards", 60: "walking apart",
-}
 
 
 def load_radar_meta_params(device):
@@ -99,7 +42,7 @@ def load_radar_meta_params(device):
     mse_weight = float(meta.get("mse_weight", 0.6))
     
     if "known_actions" in meta:
-        KNOWN_ACTIONS = list(map(int, meta["known_actions"]))
+        KNOWN_ACTIONS[:] = list(map(int, meta["known_actions"]))
         
     print("✅ 已成功加載雷達校正邊界與全域閾值")
     return centroids_norm, normalizer, threshold, dist_weight, mse_weight

@@ -1,11 +1,7 @@
-import os
-import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
 from constants import CONFIG, KNOWN_ACTIONS, ACTION_NAMES
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Functions"))
 
 from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 

@@ -9,14 +9,10 @@ import subprocess
 import time
 
 from flask import Flask, request, abort
-from dotenv import load_dotenv
-
-load_dotenv()
+from constants import LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
 # 記錄每位使用者目前的狀態，例如 "waiting_for_link" 表示正在等待輸入連結
 user_states = {}

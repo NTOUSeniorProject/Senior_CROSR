@@ -1,4 +1,5 @@
 import requests
+import constants
 from constants import LINE_CHANNEL_ACCESS_TOKEN
 
 
@@ -68,6 +69,31 @@ def push_line_message(user_id: str, text: str):
     except Exception as e:
         print("❌ LINE Push Message 發送失敗：")
         print(e)
+
+
+def should_alert_vlm(result):
+    """一般事件與尾端事件共用的 VLM 警報條件。"""
+    return bool(
+        result["is_abnormal"]
+        and result["need_alert"]
+        and result["confidence"] >= constants.VLM_ALERT_CONFIDENCE_THRESHOLD
+    )
+
+
+def build_vlm_alert_message(result):
+    """沿用一般事件的簡潔通知格式。"""
+    return (
+        "🚨 VLM 確認異常事件\n"
+        f"描述：{result['description']}\n"
+    )
+
+
+def notify_vlm_result(result, line_user_id):
+    """統一判斷及通知；無 user_id 時沿用終端機預覽模式。"""
+    if not should_alert_vlm(result):
+        print("✅ VLM 判斷未達警報門檻，不發送 LINE。")
+        return
+    push_line_message(line_user_id, build_vlm_alert_message(result))
 
 
 def build_alert_message(current_sec, consecutive_duration, radar_res, threshold):

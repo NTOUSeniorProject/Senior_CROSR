@@ -16,47 +16,13 @@ import time
 # ============================================================
 # ⚙️ 核心參數設定區 (在此調整即可)
 # ============================================================
-CONFIG = {
-    # --- Checkpoint 設定 ---
-    "auto_resume": False,          
-    "resume_checkpoint": None,     
-    
-    # --- 資料路徑與定義 ---
-    "data_root": r".\NTU60\nturgb+d_yolo_skeletons",       # ⚠️ 指向你 yolo26 轉出的 npy 資料夾
-    "known_actions": [
-        1, 2, 3, 4, 5, 6,
-        8, 9, 11, 12,
-        14, 15, 16, 17, 18, 19, 20, 21,
-        23, 25,
-        28, 29, 30, 32, 33, 34, 37,
-        41, 44, 45, 46, 47, 49
-    ],
-    "max_frames": 300,             
-    "num_nodes": 17,                               # ⚠️ 核心更正：由 25 改為 17
-    "feat_dim": 256,               
-    
-    # --- 訓練超參數 ---
-    "num_epochs": 200,              
-    "batch_size": 32,              
-    "lr_model": 0.001,             
-    "weight_decay": 1e-4,          
-    "lambda_center": 0.0001,  # 🟢 放行，但從 0.01 降到 0.0001
-    "lr_center": 0.005,       # 🟢 【極重要】將 center 學習率從 0.5 暴降到 0.005，防止它瞬間壓扁特徵             
-    
-    # --- 損失函數權重 (Loss Weights) ---
-    "lambda_center": 0.001,         
-    "max_lambda_recon": 0.5,       
-    "warmup_epochs": 10,           
-    
-    # --- 骨架中心化基準點 ---
-    "center_joint_idx": 11,                        # ⚠️ 核心更正：改用 COCO 17點的左臀 (Index 11)
-}
+from constants import TRAINING_CONFIG as CONFIG, PROJECT_ROOT, project_path
 
 # ============================================================
 # 🛠️ 輔助函式
 # ============================================================
 def find_latest_checkpoint():
-    checkpoint_files = list(Path(".").glob("checkpoints_*/last.pth"))
+    checkpoint_files = list(PROJECT_ROOT.glob("checkpoints_*/last.pth"))
     if len(checkpoint_files) == 0:
         return None
     latest_checkpoint = max(checkpoint_files, key=lambda p: p.stat().st_mtime)
@@ -80,10 +46,10 @@ def save_checkpoint(path, epoch, model, optimizer_model, optimizer_center, sched
         "known_actions": known_actions,
         "num_classes": num_classes,
     }
-    torch.save(checkpoint, path)
+    torch.save(checkpoint, project_path(path))
 
 def load_checkpoint(path, model, optimizer_model=None, optimizer_center=None, scheduler=None, scaler=None, device="cpu"):
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(project_path(path), map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"])
         if optimizer_model is not None and checkpoint.get("optimizer_model_state_dict") is not None:
@@ -123,11 +89,12 @@ if __name__ == "__main__":
         resume_checkpoint = find_latest_checkpoint()
 
     if resume_checkpoint is not None:
+        resume_checkpoint = str(project_path(resume_checkpoint))
         checkpoint_dir = str(Path(resume_checkpoint).parent)
         print(f"🔁 偵測到 checkpoint：{resume_checkpoint}")
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        checkpoint_dir = f"checkpoints_{timestamp}"
+        checkpoint_dir = str(project_path(f"checkpoints_{timestamp}"))
         print("🆕 沒有找到 checkpoint，將從頭開始訓練")
 
     if not os.path.exists(checkpoint_dir):

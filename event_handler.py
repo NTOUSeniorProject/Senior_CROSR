@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 from constants import (
+    project_path,
     PRE_EVENT_SECONDS,
     POST_EVENT_SECONDS,
     POST_MIN_ANOMALY_VOTES,
@@ -85,7 +86,7 @@ def save_anomaly_event_frames(
     if not event_frames:
         raise ValueError("異常事件沒有可保存的影格。")
 
-    event_dir = os.path.join(output_root, event_id)
+    event_dir = os.path.join(project_path(output_root), event_id)
     sampled_dir = os.path.join(event_dir, "vlm_frames")
     os.makedirs(sampled_dir, exist_ok=True)
 
