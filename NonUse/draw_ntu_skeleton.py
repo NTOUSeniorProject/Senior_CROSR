@@ -10,7 +10,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 # =========================
 # 載入你寫好的 PyTorch 正規化模組
 # =========================
-from ntu_normalize import normalize_skeleton_batch
+from common.ntu_normalize import normalize_skeleton_batch
 
 
 # =========================

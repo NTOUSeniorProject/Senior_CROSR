@@ -2,9 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import constants
-import line_notifier as notifier
-
-
+import inference.line_notifier as notifier
 class VLMNotificationTests(unittest.TestCase):
     def setUp(self):
         output = patch("builtins.print")
@@ -50,14 +48,14 @@ class VLMNotificationTests(unittest.TestCase):
         post.assert_not_called()
 
     def test_vlm_failure_does_not_notify(self):
-        import real_time_detector as detector
+        import inference.real_time_detector as detector
         with patch.object(detector, "analyze_frames_with_ollama", side_effect=RuntimeError("unavailable")), patch.object(detector, "notify_vlm_result") as notify:
             with self.assertRaises(RuntimeError):
                 detector._analyze_event_with_vlm(["frame.jpg"], "test-user")
         notify.assert_not_called()
 
     def test_event_analysis_delegates_notification_once(self):
-        import real_time_detector as detector
+        import inference.real_time_detector as detector
         result = self.result()
         with patch.object(detector, "analyze_frames_with_ollama", return_value=result), patch.object(detector, "notify_vlm_result") as notify:
             detector._analyze_event_with_vlm(["frame.jpg"], "test-user")

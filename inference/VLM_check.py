@@ -1,4 +1,4 @@
-from image_encoding import image_to_base64, image_to_data_url as _image_data_url
+from common.image_encoding import image_to_base64, image_to_data_url as _image_data_url
 import json
 from typing import Any
 

@@ -11,19 +11,16 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 from dotenv import load_dotenv
 from collections import deque
-from VLM_check import analyze_frames_with_ollama
-from movement_detection import MovementDetector
+from inference.VLM_check import analyze_frames_with_ollama
+from inference.movement_detection import MovementDetector
 
 
 load_dotenv()
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-# Functions 內部模組（如 ST_CROSR）使用頂層匯入（from STGCNEncoder import ...），
-# 必須把 Functions 目錄加入搜尋路徑才能解析
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "Functions"))
 
-from Functions.ST_CROSR import ST_CROSR
-from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
+from common.models.ST_CROSR import ST_CROSR
+from common.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 
 
 # ============================================================

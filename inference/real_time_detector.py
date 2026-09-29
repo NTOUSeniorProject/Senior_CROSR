@@ -4,12 +4,12 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from constants import CONFIG, PRE_EVENT_SECONDS, POST_EVENT_SECONDS
-from video_source import open_video_capture
-from inference import predict_one_clip, pad_or_cut_to_300
-from event_handler import start_event_collection, finish_event_collection
-from line_notifier import notify_vlm_result
-from VLM_check import analyze_frames_with_ollama
-from movement_detection import MovementDetector
+from inference.video_source import open_video_capture
+from inference.inference import predict_one_clip, pad_or_cut_to_300
+from inference.event_handler import start_event_collection, finish_event_collection
+from inference.line_notifier import notify_vlm_result
+from inference.VLM_check import analyze_frames_with_ollama
+from inference.movement_detection import MovementDetector
 from threading import Lock, Thread, Event
 from queue import Queue, Empty, Full
 

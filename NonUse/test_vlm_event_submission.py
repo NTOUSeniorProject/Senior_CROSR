@@ -2,9 +2,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
-import real_time_detector as detector
-
-
+import inference.real_time_detector as detector
 class EventSubmissionTests(unittest.TestCase):
     def setUp(self):
         output = patch("builtins.print")

@@ -13,7 +13,7 @@ import time
 from urllib.parse import urlparse
 
 import requests
-from image_encoding import image_to_base64, image_to_data_url
+from common.image_encoding import image_to_base64, image_to_data_url
 
 
 from constants import (

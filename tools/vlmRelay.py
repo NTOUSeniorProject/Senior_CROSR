@@ -5,7 +5,7 @@
      -> http://192.168.50.51:8001/v1 -> 78B 模型主機
 
 啟動方式（在 PC-lab 執行）：
-    python vlmRelay.py
+    python -m tools.vlmRelay
 """
 
 import json

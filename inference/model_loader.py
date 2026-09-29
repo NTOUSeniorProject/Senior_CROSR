@@ -2,7 +2,7 @@ import os
 import torch
 from constants import CONFIG, KNOWN_ACTIONS, DEFAULT_KNOWN_ACTIONS
 
-from Functions.ST_CROSR import ST_CROSR
+from common.models.ST_CROSR import ST_CROSR
 
 
 def load_radar_meta_params(device):

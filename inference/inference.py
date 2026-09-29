@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from constants import CONFIG, KNOWN_ACTIONS, ACTION_NAMES
 
-from Functions.ntu_normalize import normalize_skeleton_batch, get_valid_mask
+from common.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 
 
 def pad_or_cut_to_300(clip):

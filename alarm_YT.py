@@ -2,8 +2,8 @@ import sys
 import torch
 from ultralytics import YOLO
 from constants import CONFIG
-from model_loader import load_radar_meta_params, load_st_crosr_model
-from real_time_detector import play_and_live_inference
+from inference.model_loader import load_radar_meta_params, load_st_crosr_model
+from inference.real_time_detector import play_and_live_inference
 
 
 def main(video_path=None, line_user_id=None):

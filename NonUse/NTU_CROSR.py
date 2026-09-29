@@ -5,8 +5,8 @@ import os
 import numpy as np
 
 # 1. 記得修改 Import 的 Decoder 名稱
-from STGCNEncoder import STGCN_Encoder
-from strictly_bottleneck_decoder import Strictly_Bottleneck_Decoder 
+from common.models.STGCNEncoder import STGCN_Encoder
+from common.models.strictly_bottleneck_decoder import Strictly_Bottleneck_Decoder
 
 class ST_CROSR(nn.Module):
     def __init__(self, num_known_classes, num_nodes=25, target_frames=300):
