@@ -35,6 +35,21 @@ HTTP 讀取逾時指連續未讀到 socket 資料的時間，不是整支影片�
 python run_full_vlm.py "C:/linebot/Senior_CROSR/test_video/test_video1.mp4" --log baseline_test_video1_600.jsonl --timeout 600
 ```
 
+比較時請使用實際的 --log 名稱。例如 ours 也使用 --log ours_test_video1_600.jsonl 時：
+
+```bash
+python compare_tokens.py baseline_test_video1_600.jsonl ours_test_video1_600.jsonl
+```
+
+每組需要兩個檔案：--log 指定的 .jsonl，以及附加 .run.json 的檔案
+（例如 baseline_test_video1_600.jsonl.run.json）。兩個 runner 都會自動產生。
+缺檔時，新版 compare_tokens 會列出全部缺少的絕對路徑，並列出目錄內已有的 .jsonl。
+PowerShell 可用下列指令查詢目前目錄的結果檔：
+
+```powershell
+Get-ChildItem -File | Where-Object { $_.Name -like '*.jsonl*' } | Select-Object Name
+```
+
 baseline 每窗呼叫前也會印出影片時間範圍、圖片張數和讀取逾時設定。
 如果讀取逾時仍發生，請對照 PC-lab relay 與模型伺服器同時間的紀錄，
 確認是否仍在推論、排隊、模型出錯或連線中斷；僅靠客戶端 traceback 無法區分。
@@ -84,6 +99,20 @@ DOUBLE_VLM 的兩層分別記錄，不會只算最終回傳的第二層。
 有錯誤的事件會記為 error，不能拿不完整 run 宣稱有效降幅。
 
 每支影片另生成 .jsonl.run.json，包含影片 SHA256、VLM 設定、完成狀態和彙總。
+新增 video_duration_sec 欄位，記錄原影片完整長度（秒），由總影格數 / FPS 計算。
+這個欄位從實驗開始就會寫入，因此即使中途逾時，仍保留原片長。
+無法取得總影格數時 baseline 會記為 null；既有離線 ours 仍要求有效總影格數。
+compare_tokens 的輸出 JSON 也會顯示 video_duration_sec。
+
+已有結果可使用補寫工具，不必重新執行 VLM；工具會讀取紀錄中的原影片路徑，
+並驗證影片 SHA256，然後只補上或更新片長欄位：
+
+```bash
+python add_video_duration.py baseline_fall01.jsonl.run.json ours_fall01.jsonl.run.json
+```
+
+請將檔名改為實際結果檔；原影片必須仍在紀錄所列的路徑。
+補上片長會保留原本的 token 數與完成狀態，失敗的 run 仍無法作為有效比較。
 compare_tokens 驗證影片內容與 VLM/抽樣設定相同，且兩组完整完成、無錯誤、usage 無缺漏。
 使用者按 q、事件處理失敗、VLM 失敗或未完整讀完影片均不能計算有效降幅。
 若 OpenCV 提供的總影格數不正確，會保守拒絕將較少解碼影格的 run 當作完整。

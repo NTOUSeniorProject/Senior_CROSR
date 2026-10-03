@@ -190,22 +190,21 @@ def play_and_live_inference(
     """
 
     cap, resolved_source = open_video_capture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if token_log_path is not None:
         if not Path(resolved_source).is_file():
             cap.release()
             raise ValueError("token 實驗請使用相同本機影片，不使用直播")
+        if not np.isfinite(fps) or fps <= 0 or total_frames <= 0:
+            cap.release()
+            raise ValueError("離線 token 實驗需要有效 FPS 和總影格數")
         try:
-            begin_run(token_log_path, resolved_source, "ours", vlm_timeout=vlm_timeout)
+            begin_run(token_log_path, resolved_source, "ours", vlm_timeout=vlm_timeout,
+                      video_duration_sec=total_frames / fps)
         except Exception:
             cap.release()
             raise
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if token_log_path is not None and (not np.isfinite(fps) or fps <= 0 or total_frames <= 0):
-        cap.release()
-        raise ValueError("離線 token 實驗需要有效 FPS 和總影格數")
 
     if fps <= 0 or np.isnan(fps):
         fps = 30.0

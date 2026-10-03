@@ -89,7 +89,7 @@ def experiment_settings(vlm_timeout=180):
     return settings
 
 
-def begin_run(path, video, method, vlm_timeout=180):
+def begin_run(path, video, method, vlm_timeout=180, video_duration_sec=None):
     """一個程序同時只允許一個實驗；固定 log 與影片身分。"""
     path = Path(path).resolve()
     video = Path(video).resolve()
@@ -101,6 +101,7 @@ def begin_run(path, video, method, vlm_timeout=180):
     if manifest.exists() or path.exists():
         raise FileExistsError('log 或 run.json 已存在，請使用新檔名')
     payload = dict(method=method, video=str(video), video_sha256=sha256_file(video),
+                   video_duration_sec=video_duration_sec,
                    settings=experiment_settings(vlm_timeout), completed=False)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('x', encoding='utf-8'):

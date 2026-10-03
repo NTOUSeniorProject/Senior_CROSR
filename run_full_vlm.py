@@ -30,7 +30,8 @@ def main():
         cap.release()
         raise RuntimeError('無法開啟影片或取得有效 FPS')
     try:
-        begin_run(args.log, video, 'baseline', vlm_timeout=args.timeout)
+        begin_run(args.log, video, 'baseline', vlm_timeout=args.timeout,
+                  video_duration_sec=expected_frames / fps if expected_frames > 0 else None)
     except Exception:
         cap.release()
         raise
