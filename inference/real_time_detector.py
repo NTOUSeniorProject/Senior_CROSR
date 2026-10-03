@@ -1,3 +1,7 @@
+import os
+import json
+from pathlib import Path
+from inference.token_stats import begin_run, finish_run, record_error
 import time
 import cv2
 import numpy as np
@@ -107,10 +111,10 @@ class _PendingVLMEvents:
             return self._count
 
 
-def _analyze_event_with_vlm(frame_paths, line_user_id):
+def _analyze_event_with_vlm(frame_paths, line_user_id, vlm_timeout=180):
     """一般事件與尾端事件共用的 VLM 判讀及通知。"""
     print(f"🤖 將 {len(frame_paths)} 張影格交給 Ollama VLM")
-    vlm_result = analyze_frames_with_ollama(frame_paths)
+    vlm_result = analyze_frames_with_ollama(frame_paths, timeout=vlm_timeout)
     print("🧠 Ollama VLM 分析結果：", vlm_result)
 
     notify_vlm_result(vlm_result, line_user_id)
@@ -121,6 +125,7 @@ def _report_background_vlm_result(future, pending_events):
     try:
         future.result()
     except Exception as exc:
+        record_error("vlm_or_notification", str(exc))
         print(f"❌ 背景 VLM 分析失敗：{exc}")
     finally:
         pending_events.completed()
@@ -130,6 +135,7 @@ def _report_background_vlm_result(future, pending_events):
 def _finish_and_submit_event(
     event_id, event_frames, anomaly_flags, fps,
     executor, pending_events, line_user_id, force_partial=False,
+    vlm_timeout=180,
 ):
     """保存符合條件的事件並提交一次；所有事件共用計數與錯誤處理。"""
     try:
@@ -143,7 +149,7 @@ def _finish_and_submit_event(
         frame_paths = list(result["frame_paths"])
         pending_events.submitted()
         try:
-            future = executor.submit(_analyze_event_with_vlm, frame_paths, line_user_id)
+            future = executor.submit(_analyze_event_with_vlm, frame_paths, line_user_id, vlm_timeout)
         except Exception:
             pending_events.completed()
             raise
@@ -153,6 +159,7 @@ def _finish_and_submit_event(
         print(f"▶️ 事件 {event_id} 已提交 VLM，目前待完成事件：{pending_events.total()}")
         return future
     except Exception as exc:
+        record_error("event_processing", str(exc))
         print(f"❌ 異常事件 {event_id} 處理失敗：{exc}")
         return None
 
@@ -167,7 +174,10 @@ def play_and_live_inference(
     threshold,
     dist_weight,
     mse_weight,
-    line_user_id=None
+    line_user_id=None,
+    token_log_path=None,
+    experiment_media_clock=False,
+    vlm_timeout=180,
 ):
     """
     改良版異常偵測邏輯（不加入骨架品質判斷）：
@@ -180,9 +190,22 @@ def play_and_live_inference(
     """
 
     cap, resolved_source = open_video_capture(video_path)
+    if token_log_path is not None:
+        if not Path(resolved_source).is_file():
+            cap.release()
+            raise ValueError("token 實驗請使用相同本機影片，不使用直播")
+        try:
+            begin_run(token_log_path, resolved_source, "ours", vlm_timeout=vlm_timeout)
+        except Exception:
+            cap.release()
+            raise
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if token_log_path is not None and (not np.isfinite(fps) or fps <= 0 or total_frames <= 0):
+        cap.release()
+        raise ValueError("離線 token 實驗需要有效 FPS 和總影格數")
 
     if fps <= 0 or np.isnan(fps):
         fps = 30.0
@@ -302,6 +325,7 @@ def play_and_live_inference(
     current_radar_res = None
     final_video_sec = 0.0
     stopped_by_user = False
+    reached_eof = False
     vlm_executor = ThreadPoolExecutor(
         max_workers=1,
         thread_name_prefix="vlm-analysis",
@@ -311,7 +335,7 @@ def play_and_live_inference(
     motion_grace_frames = max(1, int(fps * 2.0))
     motion_hold_remaining = 0
 
-    mode_started_at = time.monotonic()
+    mode_started_at = 0.0 if experiment_media_clock else time.monotonic()
     startup_anomaly_until = (
         mode_started_at + startup_anomaly_detection_sec
     )
@@ -479,6 +503,7 @@ def play_and_live_inference(
 
                 else:
 
+                    reached_eof = True
                     print("🏁 影片已播放完畢，結束推論。")
                     break
 
@@ -509,6 +534,7 @@ def play_and_live_inference(
                     _finish_and_submit_event(
                         event_id, event_frames, post_event_anomaly_flags, fps,
                         vlm_executor, pending_vlm_events, line_user_id,
+                        vlm_timeout=vlm_timeout,
                     )
                 finally:
                     collecting_event = False
@@ -528,7 +554,7 @@ def play_and_live_inference(
                 motion_hold_remaining -= 1
 
             has_movement = raw_has_movement or motion_hold_remaining > 0
-            mode_now = time.monotonic()
+            mode_now = current_sec if experiment_media_clock else time.monotonic()
             startup_anomaly_active = mode_now < startup_anomaly_until
 
             if (
@@ -697,7 +723,7 @@ def play_and_live_inference(
                         fg_mask,
                     )
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if CONFIG.get("show_yolo_window", True) and cv2.waitKey(1) & 0xFF == ord("q"):
                     stopped_by_user = True
                     break
 
@@ -1162,6 +1188,9 @@ def play_and_live_inference(
 
             frame_idx += 1
 
+    except BaseException as exc:
+        record_error("detector_processing", str(exc))
+        raise
     finally:
         try:
             if collecting_event and event_frames:
@@ -1169,15 +1198,23 @@ def play_and_live_inference(
                 _finish_and_submit_event(
                     event_id, event_frames, post_event_anomaly_flags, fps,
                     vlm_executor, pending_vlm_events, line_user_id, force_partial=True,
+                    vlm_timeout=vlm_timeout,
                 )
         finally:
             try:
                 if live_reader is not None:
                     live_reader.stop()
                 cap.release()
-                cv2.destroyAllWindows()
+                if CONFIG.get("show_yolo_window", True):
+                    cv2.destroyAllWindows()
             finally:
                 print(f"⏳ 等候 VLM 工作完成，待處理事件：{pending_vlm_events.total()}")
                 vlm_executor.shutdown(wait=True)
+                if token_log_path is not None:
+                    report = finish_run(reached_eof and not stopped_by_user
+                        and (total_frames <= 0 or frame_idx >= total_frames),
+                        processed_frames=frame_idx, fps=fps,
+                        media_clock=experiment_media_clock)
+                    print(json.dumps(report, ensure_ascii=False, indent=2))
 
     print("\n🏁 影片分析與 VLM 工作皆已結束。")

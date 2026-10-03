@@ -3,6 +3,7 @@ import json
 from typing import Any
 
 import requests
+from inference.token_stats import record_response
 
 
 
@@ -157,7 +158,7 @@ def _request_ollama(
         response = requests.post(
             url,
             json=payload,
-            timeout=timeout,
+            timeout=(10, timeout),
         )
         response.raise_for_status()
 
@@ -169,7 +170,7 @@ def _request_ollama(
 
     except requests.Timeout as error:
         raise RuntimeError(
-            f"第 {vlm_group} 組 Ollama 推論超過 {timeout} 秒"
+            f"第 {vlm_group} 組 Ollama 連線或讀取回應逾時（讀取設定 {timeout} 秒）"
         ) from error
 
     except requests.HTTPError as error:
@@ -179,6 +180,7 @@ def _request_ollama(
         ) from error
 
     response_data = response.json()
+    token_metadata = record_response(response_data, vlm_group, "ollama", str(payload["model"]))
     raw_content = response_data["message"]["content"]
 
     result = _parse_result_json(raw_content, f"第 {vlm_group} 組 Ollama")
@@ -191,6 +193,7 @@ def _request_ollama(
         total_duration=response_data.get("total_duration"),
         load_duration=response_data.get("load_duration"),
         eval_count=response_data.get("eval_count"),
+        **token_metadata,
     )
 
 
@@ -208,7 +211,7 @@ def _request_openai_compatible(
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=timeout,
+            timeout=(10, timeout),
         )
         response.raise_for_status()
     except requests.ConnectionError as error:
@@ -218,7 +221,7 @@ def _request_openai_compatible(
         ) from error
     except requests.Timeout as error:
         raise RuntimeError(
-            f"第 {vlm_group} 層 78B VLM 推論超過 {timeout} 秒"
+            f"第 {vlm_group} 層 78B VLM 連線或讀取回應逾時（讀取設定 {timeout} 秒）"
         ) from error
     except requests.HTTPError as error:
         raise RuntimeError(
@@ -227,6 +230,7 @@ def _request_openai_compatible(
         ) from error
 
     response_data = response.json()
+    token_metadata = record_response(response_data, vlm_group, "openai-compatible", str(payload["model"]))
     try:
         raw_content = response_data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as error:
@@ -241,8 +245,7 @@ def _request_openai_compatible(
         vlm_group=vlm_group,
         backend="openai-compatible",
         model=VLM_78B_MODEL,
-        prompt_tokens=usage.get("prompt_tokens"),
-        completion_tokens=usage.get("completion_tokens"),
+        **token_metadata,
     )
 
 
@@ -328,6 +331,8 @@ def analyze_frames_with_ollama(
 ) -> dict[str, Any]:
     if not frame_paths:
         raise ValueError("沒有提供任何影格")
+    if timeout <= 0:
+        raise ValueError("timeout 必須大於 0")
     if double_vlm not in (0, 1):
         raise ValueError("double_vlm 只能是 0 或 1")
     if vlm_78b_layer not in (1, 2):

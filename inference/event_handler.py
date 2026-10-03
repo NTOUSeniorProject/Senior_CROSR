@@ -75,6 +75,41 @@ def should_keep_event(
     )
 
 
+def sample_vlm_frames(event_frames, sampled_dir, vlm_frame_count=VLM_SAMPLE_FRAME_COUNT):
+    """兩種實驗共用的均勻抽幀與 JPEG 85 前處理。"""
+    if not event_frames or vlm_frame_count <= 0:
+        raise ValueError("影格與抽樣數不可為空或零")
+    os.makedirs(sampled_dir, exist_ok=True)
+    sample_count = min(vlm_frame_count, len(event_frames))
+    if sample_count <= 1:
+        sampled_indices = [0]
+    else:
+        sampled_indices = np.linspace(
+            0,
+            len(event_frames) - 1,
+            sample_count,
+            dtype=int,
+        ).tolist()
+
+    sampled_paths = []
+    for order, frame_index in enumerate(sampled_indices):
+        item = event_frames[frame_index]
+        image_path = os.path.join(
+            sampled_dir,
+            f"frame_{order:02d}_{item['time']:.2f}s.jpg",
+        )
+        if cv2.imwrite(
+            image_path,
+            item["frame"],
+            [cv2.IMWRITE_JPEG_QUALITY, 85],
+        ):
+            sampled_paths.append(image_path)
+
+    if len(sampled_paths) != sample_count:
+        raise RuntimeError("VLM 抽樣圖片未全部寫入")
+    return sampled_paths
+
+
 def save_anomaly_event_frames(
     event_id,
     event_frames,
@@ -112,30 +147,7 @@ def save_anomaly_event_frames(
     finally:
         writer.release()
 
-    sample_count = min(vlm_frame_count, len(event_frames))
-    if sample_count <= 1:
-        sampled_indices = [0]
-    else:
-        sampled_indices = np.linspace(
-            0,
-            len(event_frames) - 1,
-            sample_count,
-            dtype=int,
-        ).tolist()
-
-    sampled_paths = []
-    for order, frame_index in enumerate(sampled_indices):
-        item = event_frames[frame_index]
-        image_path = os.path.join(
-            sampled_dir,
-            f"frame_{order:02d}_{item['time']:.2f}s.jpg",
-        )
-        if cv2.imwrite(
-            image_path,
-            item["frame"],
-            [cv2.IMWRITE_JPEG_QUALITY, 85],
-        ):
-            sampled_paths.append(image_path)
+    sampled_paths = sample_vlm_frames(event_frames, sampled_dir, vlm_frame_count)
 
     print(f"🎬 異常影片已保存：{video_path}")
     print(f"🖼️ 已抽取 {len(sampled_paths)} 張 VLM 影格：{sampled_dir}")
