@@ -1,17 +1,29 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def project_path(path):
+    """相對檔案路徑以專案根目錄解析；保留絕對路徑。"""
+    path = Path(path).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 # ============================================================
 # 配置區
 # ============================================================
 CONFIG = {
     "video_path": r"https://youtu.be/kD0RBvXA1q4?si=ZJnV3lV45Yifloay",
-    "yolo_model_path": r"yolo26x-pose.pt",
-    "checkpoint_path": r"checkpoints_20260602_2237\best_val.pth",
-    "radar_meta_path": r"radar_meta_params.pth",
+    "yolo_model_path": str(project_path("yolo26x-pose.pt")),
+    "checkpoint_path": str(project_path("checkpoints_20260602_2237/best_val.pth")),
+    "radar_meta_path": str(project_path("radar_meta_params.pth")),
 
+    "data_root": str(project_path("NTU60/nturgb+d_yolo_skeletons")),
+    "video_data_root": str(project_path("NTU60/nturgb+d_rgb")),
     "max_frames": 300,
     "num_nodes": 17,
     "center_joint_idx": 11,
@@ -23,9 +35,7 @@ CONFIG = {
     "anomaly_vote_ratio": 0.70,
     "min_anomaly_votes": 3,
 
-    "consecutive_alert_sec": 2.0,
     "clear_normal_windows": 3,
-    "alert_cooldown_sec": 30.0,
 
     "use_saved_threshold": False,
     "manual_threshold": 0.35,
@@ -52,6 +62,7 @@ CONFIG = {
 
 # LINE 通知設定
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
 # 已知動作清單
 DEFAULT_KNOWN_ACTIONS = [
@@ -90,4 +101,44 @@ POST_EVENT_SECONDS = 5.0
 POST_MIN_ANOMALY_VOTES = 1
 POST_ANOMALY_RATIO_THRESHOLD = 0.30
 VLM_SAMPLE_FRAME_COUNT = 8
-ANOMALY_OUTPUT_ROOT = "./abnormal_events"
+VLM_ALERT_CONFIDENCE_THRESHOLD = 0.75
+ANOMALY_OUTPUT_ROOT = str(project_path("abnormal_events"))
+EVALUATION_OUTPUT_ROOT = project_path("output/evaluation")
+
+
+# 訓練共用推論的資料與骨架設定；專用超參數也集中在此。
+TRAINING_CONFIG = {
+    **CONFIG,
+    "known_actions": DEFAULT_KNOWN_ACTIONS.copy(),
+    'auto_resume': False,
+    'resume_checkpoint': None,
+    'feat_dim': 256,
+    'num_epochs': 200,
+    'batch_size': 32,
+    'lr_model': 0.001,
+    'weight_decay': 0.0001,
+    'lambda_center': 0.001,
+    'lr_center': 0.005,
+    'max_lambda_recon': 0.5,
+    'warmup_epochs': 10,
+}
+
+
+# ===== VLM 連線設定（共用於正式分析與連線測試）=====
+OLLAMA_BASE_URL = "http://26.184.142.137:11434"
+OLLAMA_URL = f"{OLLAMA_BASE_URL}/api/chat"
+OLLAMA_MODEL = "blaifa/InternVL3_5:8B"
+
+# 本機 -> PC-lab relay -> 78B 大型主機
+VLM_78B_BASE_URL = "http://26.184.142.137:9000/v1"
+VLM_78B_CHAT_URL = f"{VLM_78B_BASE_URL}/chat/completions"
+VLM_78B_MODEL = "OpenGVLab/InternVL3-78B-AWQ"
+VLM_78B_API_KEY = "EMPTY"
+
+# 0：只使用第一組 VLM
+# 1：第一組判定無異常時，再將相同資料送至第二組 VLM
+DOUBLE_VLM = 1
+
+# 1：78B 放在第一層，Ollama 4B 放在第二層
+# 2：Ollama 4B 放在第一層，78B 放在第二層
+VLM_78B_LAYER = 2

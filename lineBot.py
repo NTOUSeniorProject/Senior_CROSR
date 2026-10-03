@@ -9,14 +9,10 @@ import subprocess
 import time
 
 from flask import Flask, request, abort
-from dotenv import load_dotenv
-
-load_dotenv()
+from constants import LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
 # 記錄每位使用者目前的狀態，例如 "waiting_for_link" 表示正在等待輸入連結
 user_states = {}
@@ -316,10 +312,10 @@ def callback():
                         {
                             "type": "text",
                             "text": (
-                                "請輸入 OctoStream 顯示的完整 RTSP 網址。\n\n"
+                                "請輸入完整 RTSP 網址。\n\n"
                                 "例如：\n"
                                 "rtsp://192.168.1.105:8554/stream\n\n"
-                                "請確認 iPhone 與執行程式的電腦連接同一個 Wi-Fi。"
+                                "請確認手機與執行程式的電腦連接同一個 Wi-Fi。"
                             )
                         }
                     ])
@@ -391,8 +387,7 @@ def callback():
                                 "type": "text",
                                 "text": (
                                     "📹 已收到 IP Cam 串流網址！\n"
-                                    "正在連接 iPhone 相機並開始即時分析。\n\n"
-                                    "請保持 OctoStream 開啟，且不要鎖定 iPhone 螢幕。"
+                                    "正在連接手機相機並開始即時分析。\n\n"
                                 )
                             }
                         ])

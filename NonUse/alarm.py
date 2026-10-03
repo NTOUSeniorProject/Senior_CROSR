@@ -1,3 +1,4 @@
+from constants import CONFIG, KNOWN_ACTIONS, ACTION_NAMES
 import os
 import cv2
 import torch
@@ -12,71 +13,13 @@ from common.ntu_normalize import normalize_skeleton_batch, get_valid_mask
 # ============================================================
 # 設定區
 # ============================================================
-CONFIG = {
-    # 實際測試影片
-    # "video_path": r"C:\CROSR\downloads\摔倒参考.mp4",
-    "video_path": r"C:\CROSR\IMG_2033.mov",
-
-    # YOLO pose 權重
-    "yolo_model_path": r"C:\CROSR\yolo26x-pose.pt",
-
-    # ST-CROSR checkpoint
-    "checkpoint_path": r"checkpoints_20260602_2237\best_val.pth",
-
-    # 由 test_ntu_dataset.py 事先產生好的雷達校正參數
-    "radar_meta_path": r"C:\CROSR\radar_meta_params.pth",
-
-    # 跟訓練時一致
-    "max_frames": 300,
-    "num_nodes": 17,
-    "center_joint_idx": 11,
-
-    # 滑動視窗設定 (30 FPS 時：window_size=120 約 4 秒，stride=30 約 1 秒更新一次雷達)
-    "window_size": 120,
-    "stride": 30,
-
-    # 是否使用 radar_meta_params.pth 裡面的 threshold
-    "use_saved_threshold": True,
-
-    # 手動 threshold (只有 use_saved_threshold=False 時才會使用)
-    "manual_threshold": 0.1471,
-
-    # 如果連續偵測異常，幾秒內不要重複警報
-    "alert_cooldown_sec": 4,
-
-    # 是否顯示即時監控顯示畫面
-    "show_yolo_window": True,
-}
+# ============================================================
+# 設定區
+# ============================================================
 
 
-DEFAULT_KNOWN_ACTIONS = [
-    1, 2, 3, 4, 5, 6,
-    8, 9, 11, 12,
-    14, 15, 16, 17, 18, 19, 20, 21,
-    23, 25,
-    28, 29, 30, 32, 33, 34, 37,
-    41, 44, 45, 46, 47, 49
-]
 
-KNOWN_ACTIONS = DEFAULT_KNOWN_ACTIONS.copy()
 
-ACTION_NAMES = {
-    1: "drink water", 2: "eat meal/snack", 3: "brushing teeth", 4: "brushing hair",
-    5: "drop", 6: "pickup", 7: "throw", 8: "sitting down", 9: "standing up",
-    10: "clapping", 11: "reading", 12: "writing", 13: "tear up paper",
-    14: "wear jacket", 15: "take off jacket", 16: "wear shoe", 17: "take off shoe",
-    18: "wear glasses", 19: "take off glasses", 20: "put on hat/cap", 21: "take off hat/cap",
-    22: "cheer up", 23: "hand waving", 24: "kicking something", 25: "reach into pocket",
-    26: "hopping", 27: "jump up", 28: "make a phone call", 29: "playing with phone/tablet",
-    30: "typing on keyboard", 31: "pointing to something", 32: "taking a selfie",
-    33: "check time", 34: "rub two hands", 35: "nod head/bow", 36: "shake head",
-    37: "wipe face", 38: "salute", 39: "put palms together", 40: "cross hands in front",
-    41: "sneeze/cough", 42: "staggering", 43: "falling", 44: "touch head",
-    45: "touch chest", 46: "touch back", 47: "touch neck", 48: "nausea/vomiting",
-    49: "use a fan", 50: "punching/slapping", 51: "kicking", 52: "pushing",
-    53: "pat on back", 54: "point finger", 55: "hugging", 56: "giving object",
-    57: "touch pocket", 58: "shaking hands", 59: "walking towards", 60: "walking apart",
-}
 
 
 def load_radar_meta_params(device):
@@ -99,7 +42,7 @@ def load_radar_meta_params(device):
     mse_weight = float(meta.get("mse_weight", 0.6))
     
     if "known_actions" in meta:
-        KNOWN_ACTIONS = list(map(int, meta["known_actions"]))
+        KNOWN_ACTIONS[:] = list(map(int, meta["known_actions"]))
         
     print("✅ 已成功加載雷達校正邊界與全域閾值")
     return centroids_norm, normalizer, threshold, dist_weight, mse_weight
@@ -192,24 +135,27 @@ def play_and_live_inference(video_path, yolo_model, model, device, centroids_nor
     print("\n============================================================")
     print("🚀 啟動即時序列串流推論監控系統...")
     print(f"影片預估總長度: {total_frames / fps:.2f} 秒 (共 {total_frames} 幀)")
+    threshold_label = "使用儲存閾值" if CONFIG["use_saved_threshold"] else f"手動閾值 = {threshold:.4f}"
+    print(f"閾值模式: {threshold_label}")   
+    print(f"報警模式: {'連續 ' + str(CONFIG['consecutive_alert_sec']) + ' 秒才報警' if CONFIG['use_consecutive_alert'] else '單次即報警'}")
     print("============================================================\n")
 
     skeleton_buffer = []
     frame_idx = 0
     last_alert_time = -9999
-    
-    # 儲存最新的雷達探測結果，用來即時渲染在播放畫面上
     current_radar_res = None
+
+    # 連續異常計時用
+    consecutive_anomaly_start = None   # 記錄「本次連續異常」從哪秒開始
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Step 1: 抽取當前單幀的 YOLO 17點骨架
+        # Step 1: 抽取當前單幀骨架
         one_frame_skeleton = np.zeros((2, 17), dtype=np.float32)
         results = yolo_model(frame, verbose=False)
-
         if len(results) > 0 and results[0].keypoints is not None:
             keypoints = results[0].keypoints.xy
             if keypoints is not None and len(keypoints) > 0:
@@ -218,62 +164,91 @@ def play_and_live_inference(video_path, yolo_model, model, device, centroids_nor
                     one_frame_skeleton[0, :] = person_kpts[:17, 0]
                     one_frame_skeleton[1, :] = person_kpts[:17, 1]
 
-        # 將當前幀的骨架打入右側的動態滑動視窗快取
         skeleton_buffer.append(one_frame_skeleton)
         current_sec = frame_idx / fps
 
-        # Step 2: 判定是否觸發滑動視窗評估
-        # 當累積的幀數滿足一個 window_size 且每隔 stride 幀，立刻進行 ST-CROSR 計算
+        # Step 2: 滑動視窗觸發評估
         if len(skeleton_buffer) >= CONFIG["window_size"] and (frame_idx % CONFIG["stride"] == 0):
-            # 取出最近的 N 幀骨架快取
             clip = np.stack(skeleton_buffer[-CONFIG["window_size"]:], axis=0)
-            clip = np.transpose(clip, (1, 0, 2))  # [W, 2, 17] -> [2, W, 17]
+            clip = np.transpose(clip, (1, 0, 2))
             clip_padded = pad_or_cut_to_300(clip)
 
-            # 丟進大腦模型做開集辨識
             current_radar_res = predict_one_clip(
                 model, clip_padded, device, centroids_norm, normalizer, threshold, dist_weight, mse_weight
             )
 
-            # 【核心功能】如果發現異常，當場在控制台輸出「精準到秒」的紅色強效警告！
+            # Step 3: 報警判斷
             if current_radar_res["is_unknown"]:
-                if current_sec - last_alert_time >= CONFIG["alert_cooldown_sec"]:
-                    print(f"🚨 【異常爆警!!】影片撥放到 [ {current_sec:6.2f} 秒 ] 🔴 綜合異常分：{current_radar_res['combined_score']:.4f} 超過安全閾值 ({threshold:.4f})！")
-                    print(f"    -> 系統判定：此動作為未知類別 (最接近的正常動作範本為: {current_radar_res['nearest_action_name']})")
-                    last_alert_time = current_sec
-                else:
-                    print(f"⚠️ [持續異常偵測中] 影片時間: {current_sec:6.2f} 秒 | 處於冷卻時間內，跳過重複報警。")
+                if CONFIG["use_consecutive_alert"]:
+                    # 連續異常模式：計算連續異常持續時間
+                    if consecutive_anomaly_start is None:
+                        consecutive_anomaly_start = current_sec
 
-        # Step 3: 即時渲染畫面的視覺化 UI
+                    consecutive_duration = current_sec - consecutive_anomaly_start
+
+                    if consecutive_duration >= CONFIG["consecutive_alert_sec"]:
+                        if current_sec - last_alert_time >= CONFIG["alert_cooldown_sec"]:
+                            print(f"🚨 【異常爆警!!】影片播放到 [ {current_sec:6.2f} 秒 ] 🔴 "
+                                  f"連續異常 {consecutive_duration:.1f} 秒，"
+                                  f"綜合異常分：{current_radar_res['combined_score']:.4f} 超過閾值 ({threshold:.4f})！")
+                            print(f"    -> 最接近正常動作：{current_radar_res['nearest_action_name']}")
+                            last_alert_time = current_sec
+                        else:
+                            print(f"⚠️ [持續異常偵測中] {current_sec:6.2f} 秒 | 冷卻中，跳過重複報警。")
+                    else:
+                        print(f"⏳ [異常累積中] {current_sec:6.2f} 秒 | "
+                              f"已持續 {consecutive_duration:.1f}/{CONFIG['consecutive_alert_sec']} 秒 "
+                              f"| 分數：{current_radar_res['combined_score']:.4f}")
+                else:
+                    # 單次即報警模式（原始行為）
+                    if current_sec - last_alert_time >= CONFIG["alert_cooldown_sec"]:
+                        print(f"🚨 【異常爆警!!】影片播放到 [ {current_sec:6.2f} 秒 ] 🔴 "
+                              f"綜合異常分：{current_radar_res['combined_score']:.4f} 超過閾值 ({threshold:.4f})！")
+                        print(f"    -> 最接近正常動作：{current_radar_res['nearest_action_name']}")
+                        last_alert_time = current_sec
+                    else:
+                        print(f"⚠️ [持續異常偵測中] {current_sec:6.2f} 秒 | 冷卻中，跳過重複報警。")
+            else:
+                # 恢復正常，重置連續計時器
+                if consecutive_anomaly_start is not None:
+                    print(f"✅ [{current_sec:6.2f} 秒] 異常解除，連續異常中斷。")
+                    consecutive_anomaly_start = None
+
+        # Step 4: 即時渲染 UI
         if CONFIG["show_yolo_window"]:
             display_frame = frame.copy()
-            
-            # 1. 頂部繪製動態時間軸畫布
+
             cv2.rectangle(display_frame, (10, 10), (320, 50), (0, 0, 0), -1)
             cv2.putText(display_frame, f"Time: {current_sec:.2f}s / {total_frames/fps:.2f}s", (20, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-            # 2. 如果雷達引擎有算好的結果，直接大膽地畫到畫面上
             if current_radar_res is not None:
-                if current_radar_res["is_unknown"]:
-                    # 如果有異常，在影片最上方橫切出一整條極其顯眼的紅色震撼警報大字！
+                # 連續異常模式下，只有達到秒數才顯示紅色警報
+                is_alerting = current_radar_res["is_unknown"] and (
+                    not CONFIG["use_consecutive_alert"] or
+                    (consecutive_anomaly_start is not None and
+                     current_sec - consecutive_anomaly_start >= CONFIG["consecutive_alert_sec"])
+                )
+
+                if is_alerting:
                     cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1], 60), (0, 0, 255), -1)
-                    cv2.putText(display_frame, f"🚨 ALARM: UNKNOWN ANOMALY DETECTED AT {current_sec:.2f}s! 🚨", (20, 38),
+                    cv2.putText(display_frame, f"ALARM: UNKNOWN ANOMALY AT {current_sec:.2f}s", (20, 38),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                    
-                    # 畫面下方顯示數值面板
                     cv2.putText(display_frame, f"Score: {current_radar_res['combined_score']:.4f} (Thresh: {threshold:.4f})", (20, 95),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
+                elif current_radar_res["is_unknown"] and CONFIG["use_consecutive_alert"]:
+                    # 累積中：顯示黃色警告
+                    elapsed = current_sec - consecutive_anomaly_start if consecutive_anomaly_start else 0
+                    cv2.putText(display_frame, f"WARNING: Accumulating {elapsed:.1f}/{CONFIG['consecutive_alert_sec']}s", (20, 85),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2, cv2.LINE_AA)
                 else:
-                    # 如果正常，顯示綠色放行字樣與當前的分類預測結果
                     cv2.putText(display_frame, f"STATUS: NORMAL ({current_radar_res['combined_score']:.4f})", (20, 85),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
                     cv2.putText(display_frame, f"ACT: {current_radar_res['action_name']} ({current_radar_res['confidence']*100:.1f}%)", (20, 115),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
 
             cv2.imshow("ST-CROSR Live Real-Time Radar Monitor", display_frame)
-            
-            # 按 'q' 鍵可隨時優雅退場
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("🛑 使用者手動中斷串流播放。")
                 break
