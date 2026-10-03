@@ -1042,6 +1042,27 @@ def play_and_live_inference(
             if CONFIG.get("show_yolo_window", True):
                 display_frame = frame.copy()
 
+                # 與 keypoints[0] 對應，只框出目前交給 CROSR 分析的人物。
+                if frame_has_person and results[0].boxes is not None:
+                    boxes = results[0].boxes.xyxy
+                    if len(boxes) > 0:
+                        box = boxes[0].detach().cpu().numpy()
+                        if np.isfinite(box).all():
+                            height, width = display_frame.shape[:2]
+                            x1, x2 = np.clip(box[[0, 2]], 0, width - 1).astype(int)
+                            y1, y2 = np.clip(box[[1, 3]], 0, height - 1).astype(int)
+                            if x2 > x1 and y2 > y1:
+                                cv2.rectangle(
+                                    display_frame, (x1, y1), (x2, y2),
+                                    (0, 255, 0), 2,
+                                )
+                                cv2.putText(
+                                    display_frame, "Monitored person",
+                                    (x1, max(20, y1 - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    (0, 255, 0), 2, cv2.LINE_AA,
+                                )
+
                 if is_live_like_source:
                     time_text = (
                         f"Time: {current_sec:.2f}s / LIVE"
