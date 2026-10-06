@@ -48,6 +48,7 @@ CONFIG = {
 
     # 異常偵測與移動偵測的切換條件
     "startup_anomaly_detection_sec": 10.0,
+    "stationary_before_background_sec": 5.0,
     "movement_anomaly_interval_sec": 90.0,
     "movement_anomaly_duration_sec": 60.0,
 

@@ -308,17 +308,16 @@ def play_and_live_inference(
     )
     pending_vlm_events = _PendingVLMEvents()
 
-    motion_grace_frames = max(1, int(fps * 2.0))
-    motion_hold_remaining = 0
+    no_movement_since = None
+    stationary_before_background_sec = max(
+        0.0, float(CONFIG.get("stationary_before_background_sec", 5.0))
+    )
 
     mode_started_at = time.monotonic()
     startup_anomaly_until = (
         mode_started_at + startup_anomaly_detection_sec
     )
-    person_presence_memory_sec = max(
-        3.0,
-        motion_grace_frames / fps + 1.0,
-    )
+    person_presence_memory_sec = 3.0
     last_person_seen_at = None
     movement_detection_mode = False
     movement_mode_person_present = False
@@ -427,7 +426,7 @@ def play_and_live_inference(
                                 anomaly_event_start = None
                                 consecutive_normal_count = 0
                                 current_anomaly_ratio = 0.0
-                                motion_hold_remaining = 0
+                                no_movement_since = None
                                 last_person_seen_at = None
                                 movement_detection_mode = False
                                 movement_mode_person_present = False
@@ -522,13 +521,17 @@ def play_and_live_inference(
                 motion_detector.check_whether_move(frame)
             )
 
-            if raw_has_movement:
-                motion_hold_remaining = motion_grace_frames
-            elif motion_hold_remaining > 0:
-                motion_hold_remaining -= 1
-
-            has_movement = raw_has_movement or motion_hold_remaining > 0
             mode_now = time.monotonic()
+            if raw_has_movement:
+                no_movement_since = None
+            elif no_movement_since is None:
+                no_movement_since = mode_now
+
+            # 不分有無人物，連續無移動滿指定秒數後才允許切入背景模式。
+            has_movement = raw_has_movement or (
+                no_movement_since is not None
+                and mode_now - no_movement_since < stationary_before_background_sec
+            )
             startup_anomaly_active = mode_now < startup_anomaly_until
 
             if (
@@ -1052,15 +1055,19 @@ def play_and_live_inference(
                             x1, x2 = np.clip(box[[0, 2]], 0, width - 1).astype(int)
                             y1, y2 = np.clip(box[[1, 3]], 0, height - 1).astype(int)
                             if x2 > x1 and y2 > y1:
+                                box_color = (
+                                    (0, 0, 255) if detection_state in ("candidate", "alert")
+                                    else (0, 255, 0)
+                                )
                                 cv2.rectangle(
                                     display_frame, (x1, y1), (x2, y2),
-                                    (0, 255, 0), 2,
+                                    box_color, 2,
                                 )
                                 cv2.putText(
                                     display_frame, "Monitored person",
                                     (x1, max(20, y1 - 8)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                    (0, 255, 0), 2, cv2.LINE_AA,
+                                    box_color, 2, cv2.LINE_AA,
                                 )
 
                 if is_live_like_source:
@@ -1114,7 +1121,7 @@ def play_and_live_inference(
                         f"(vote "
                         f"{current_anomaly_ratio * 100:.0f}%)"
                     )
-                    status_color = (0, 165, 255)
+                    status_color = (0, 0, 255)
 
                 else:
                     status_text = (
