@@ -17,3 +17,5 @@ checkpoints_20260602_2237
 test_video
 *.jsonl
 *.json
+video
+output
